@@ -283,11 +283,29 @@ final report):
   ],
   "regression": {
     "resolved":         ["20260518-140000:F1"],
-    "dismissed":        ["20260518-140000:F3"],
     "newly_introduced": ["F1"]
   },
-  "suppressed_by_dismissals": [
-    "src/db.rs:120:n_plus_1_query_in_load_users"
+  "dismissed_active": [
+    {
+      "ref":         "20260518-140000:F3",
+      "fingerprint": "src/db.rs:120:n_plus_1_query_in_load_users",
+      "severity":    "HIGH",
+      "category":    "Performance",
+      "file":        "src/db.rs",
+      "line":        120,
+      "end_line":    null,
+      "summary":     "N+1 query in load_users"
+    },
+    {
+      "ref":         null,
+      "fingerprint": "src/auth.rs:88:weak_password_check",
+      "severity":    "HIGH",
+      "category":    "Security",
+      "file":        "src/auth.rs",
+      "line":        88,
+      "end_line":    null,
+      "summary":     "Weak password hash (pre-2018 style)"
+    }
   ],
   "linter_summary": {
     "rubocop": { "ran": true, "issues": 3 },
@@ -315,26 +333,31 @@ Conventions:
 - **`carried_from`** is `null` for findings raised fresh this round;
   `"<prev_round>:<prev_id>"` when the finding was carried forward from a
   prior round during a Delta's re-verification.
-- `regression` records the disposition of every prior finding:
+- `regression` records the disposition of prior findings *that are not
+  dismissed*:
   - `resolved` — prior IDs whose code is no longer present.
-  - `dismissed` — prior IDs whose fingerprint matches a current
-    `DISMISSALS.md` entry; the code still exhibits the issue but the user
-    has marked it a false positive. These do **not** appear in the new
-    `findings` list and do **not** count toward the verdict.
   - `newly_introduced` — this round's own IDs (so a reader can quickly see
     what showed up since last time).
   - "still present and not dismissed" is implicit: those are the items in
     `findings[]` with `carried_from` set.
-- `suppressed_by_dismissals` lists fingerprints the arbiter would have
-  flagged this round (either fresh in a Full review, or first-time in a
-  Delta round) but suppressed because they match an active dismissal in
-  `DISMISSALS.md`. This is **for visibility / auditability only** — these
-  do not appear in `findings[]` and don't count toward the verdict, but
-  the user can see what was filtered out so they can re-enable any
-  finding by removing the dismissal (which will then break the gate via
-  `dismissals_changed` and force a fresh review that includes it).
-  Fingerprints listed here must match real entries in `DISMISSALS.md`
-  (enforced by validation).
+- `dismissed_active` is the **authoritative store** of findings whose code
+  still exists in the branch but is dismissed via `DISMISSALS.md`. Two
+  flavours, distinguished by `ref`:
+  - `ref: "<prev_round>:<prev_id>"` — a finding carried from a prior round
+    (either it was in `findings[]` of the prior round and is now dismissed,
+    or it was already in `dismissed_active` and remains).
+  - `ref: null` — a finding the arbiter would have flagged this round but
+    suppressed because it matches an active dismissal (Full mode fresh
+    catch, or first-time-in-Delta).
+  Every entry carries the full finding detail (severity, category, file,
+  line, summary, fingerprint) — not just an ID. This is critical: when the
+  user later removes a dismissal, Delta uses the carried structured detail
+  to re-verify the finding and either resurrect it into `findings[]` or
+  mark it `resolved`. Without the detail here, a removed dismissal could
+  silently allow the issue back into the codebase.
+  Items here do **not** count toward the verdict (they are suppressed).
+  Validation requires every fingerprint to match an actual
+  `DISMISSALS.md` entry.
 - `linter_summary` and `tests` are presence/issue counts only — full output
   remains in the Markdown report.
 
@@ -439,25 +462,41 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
    the dismissal can affect the verdict and the gate.
 5. **Carry-forward unresolved findings** (the verdict-correctness gate).
    Read the previous round's `findings.json` (per §3.3). The arbiter is
-   passed `prior_findings.json` (a copy of `prev.findings.json`'s
-   `findings` array) and is explicitly instructed:
+   passed `prior_findings.json`, a single array that is the **union** of:
+   - `prev.findings[]` (each annotated with `_was_dismissed: false`)
+   - `prev.dismissed_active[]` (each annotated with `_was_dismissed: true`
+     and `_was_ref: <prev_ref>` if the prior entry had `ref != null`)
+
+   The arbiter is explicitly instructed:
 
    > For each entry in `prior_findings.json`, re-verify it against the
-   > current branch state. For each:
-   > - If the code at that file/line still exhibits the issue AND the
-   >   finding's fingerprint matches a `DISMISSALS.md` entry → list its
-   >   `<prev_round>:<prev_id>` in `regression.dismissed`. Do **not** include
-   >   it in `findings`. This finding will not count toward the verdict.
-   > - If the code still exhibits the issue and it is **not** dismissed →
-   >   emit a Finding in `findings.json` with `carried_from: "<prev_round>:<prev_id>"`.
-   > - If the issue is no longer present → list its `<prev_round>:<prev_id>`
-   >   in `regression.resolved`.
-   > - If the file no longer exists → list it in `regression.resolved` with
-   >   a note "(file removed)" in the human-readable report.
+   > current branch state AND the current `DISMISSALS.md`. For each:
    >
-   > Do not silently drop prior findings. Every entry in `prior_findings.json`
-   > must end up in **exactly one** of: `findings[].carried_from`,
-   > `regression.resolved`, or `regression.dismissed`.
+   > - If the code at that file/line **no longer exhibits the issue** →
+   >   list its `<prev_round>:<prev_id>` in `regression.resolved`. If the
+   >   entry was previously dismissed (no `<prev_id>`, came from
+   >   `dismissed_active` with `ref: null`), use its fingerprint as the
+   >   reference: `"resolved:<fingerprint>"`.
+   > - Else (issue still present):
+   >   - If its fingerprint matches an active `DISMISSALS.md` entry →
+   >     emit an entry in `dismissed_active[]` with the full finding
+   >     detail and `ref` set to its prior reference (preserving lineage).
+   >   - Else (dismissal removed OR never dismissed) → emit a Finding in
+   >     `findings[]` with `carried_from` set to its prior reference.
+   >
+   > Do not silently drop any prior entry. Every entry in
+   > `prior_findings.json` must end up in **exactly one** of:
+   > `findings[].carried_from`, `dismissed_active[]` (with matching `ref`),
+   > or `regression.resolved`.
+
+   The arbiter is also told to scan the new material (new commits +
+   uncommitted) for issues. New findings whose fingerprint matches an
+   active dismissal go to `dismissed_active[]` with `ref: null`. New
+   un-dismissed findings go to `findings[]` with `carried_from: null`.
+
+   This means a Delta whose only change is "user removed a dismissal" will
+   see the previously suppressed entry move from `prev.dismissed_active[]`
+   into the new `findings[]` — the verdict is recomputed correctly.
 
    This means the new Delta's verdict is computed from **all currently-present
    findings (carried forward + new)**, not just findings the agents found in
@@ -526,43 +565,48 @@ Validation steps (run in this order):
 2. **Schema required fields.** Each required key from §3.3 present with
    correct type:
    - Top-level: `round`, `verdict`, `head_sha`, `base_sha`, `findings`,
-     `open_questions`, `regression` (with sub-keys `resolved`,
-     `dismissed`, `newly_introduced`, each an array of strings),
-     `suppressed_by_dismissals` (array of strings).
-   - Each finding: `id`, `severity`, `category`, `file`,
+     `open_questions`, `regression` (with sub-keys `resolved` and
+     `newly_introduced`, each an array of strings), `dismissed_active`
+     (array of objects per §3.3).
+   - Each `findings[]` entry: `id`, `severity`, `category`, `file`,
      `line` (positive integer, **not null** — file-level findings use
      `line: 1`), `end_line` (positive integer or `null`),
      `summary`, `fingerprint`, `reviewers_agreeing`,
      `carried_from` (string or `null`).
+   - Each `dismissed_active[]` entry: `ref` (string or `null`),
+     `fingerprint`, `severity`, `category`, `file`, `line` (positive
+     integer), `end_line` (positive integer or `null`), `summary`.
 3. **Enum constraints.** `verdict ∈ {APPROVE, APPROVE_WITH_COMMENTS,
-   REQUEST_CHANGES, BLOCK}`. `severity ∈ {CRITICAL, HIGH, MEDIUM, LOW}` for
-   every finding. `confidence ∈ {HIGH, MEDIUM, LOW}` if present.
-4. **Verdict / severity consistency.** Apply the §7 rubric mechanically.
-   The recorded `verdict` must equal the verdict that the listed findings
-   would produce. Mismatch → fail.
-5. **Carry-forward accounting (Delta only).** Every entry in
-   `prior_findings.json` (from the prior round) must appear in **exactly
-   one** of:
-   - this round's `findings` array with `carried_from` set to
-     `"<prev_round>:<prev_id>"`, or
-   - `regression.resolved` as `"<prev_round>:<prev_id>"`, or
-   - `regression.dismissed` as `"<prev_round>:<prev_id>"`.
-   No prior finding may be silently dropped or double-counted. Likewise,
-   every `carried_from` reference must point to a real ID in
-   `prior_findings.json`, and every ID in `regression.dismissed` must have
-   a matching fingerprint in the current `DISMISSALS.md`.
-7. **Dismissal suppression (both modes).** For every entry in
-   `findings[]`:
+   REQUEST_CHANGES, BLOCK}`. `severity ∈ {CRITICAL, HIGH, MEDIUM, LOW}` in
+   both `findings[]` and `dismissed_active[]`. `confidence ∈ {HIGH,
+   MEDIUM, LOW}` if present.
+4. **Verdict / severity consistency.** Apply the §7 rubric mechanically
+   to `findings[]` only (`dismissed_active[]` does not count). The
+   recorded `verdict` must equal the rubric output. Mismatch → fail.
+5. **Carry-forward accounting (Delta only).** Compute
+   `prior_findings = prev.findings ∪ prev.dismissed_active`. Every entry
+   must appear in **exactly one** of:
+   - new `findings[]` with `carried_from` set to its prior reference, or
+   - new `dismissed_active[]` with `ref` set to its prior reference, or
+   - `regression.resolved` referencing its prior identifier.
+   No prior entry may be silently dropped or double-counted.
+   Every `carried_from` value must point to a real prior reference, and
+   every non-`null` `ref` in `dismissed_active[]` must point to a real
+   prior reference.
+6. **Dismissal coherence (both modes).** For every entry in `findings[]`:
    - The finding's `fingerprint` must **not** match any active dismissal
      in `DISMISSALS.md`. Match → validation fails (the arbiter violated
      the suppression rule; on retry the arbiter is reminded explicitly).
-   For every entry in `suppressed_by_dismissals`:
-   - It must match a fingerprint present in `DISMISSALS.md`. No match →
-     validation fails (the arbiter cited a non-existent dismissal).
+   For every entry in `dismissed_active[]`:
+   - Its `fingerprint` must match an active `DISMISSALS.md` entry. No
+     match → validation fails (the arbiter cited a non-existent
+     dismissal).
    These rules apply to both Full and Delta reviews so dismissals are
    honoured at the source of every report, not only via carry-forward.
-6. **Fingerprint plausibility.** Each `fingerprint` matches the pattern
-   `<file>:<line>:<slug>` and is internally unique within the file.
+7. **Fingerprint plausibility.** Each `fingerprint` in both
+   `findings[]` and `dismissed_active[]` matches the pattern
+   `<file>:<line>:<slug>` and the file+line+slug are internally
+   consistent with the entry's own `file`, `line`, `summary` fields.
 
 On failure:
 
@@ -621,9 +665,21 @@ model below is firm.)
 The gate proceeds in this order; the first short-circuit decides:
 
 ```
-# 0. Nothing-to-push bypass — no commits ahead of the push's upstream.
-#    Local dirty state is irrelevant (push only ships commits).
-if no commits ahead of @{u} or origin/<branch>:
+# 0. Nothing-to-push bypass — derive the *effective remote ref* the push
+#    will move, from the parsed push form (see §5.7), and check whether
+#    HEAD has any commits ahead of it. Local dirty state is irrelevant.
+#
+#    effective_remote_ref derivation (matches the intercepted forms in §5.7):
+#      `git push` (with push.default ∈ {simple, current, upstream}) → @{u}
+#      `git push origin HEAD`                                        → @{u}
+#      `git push origin <current-branch>`                            → origin/<current-branch>
+#      `git push origin HEAD:<current-branch>`                       → origin/<current-branch>
+#      `git push -u origin <current-branch>` (--set-upstream)        → origin/<current-branch> if it exists, else "everything is new" (no bypass)
+#      `git push --force[-with-lease] <one of the above>`            → derive from the inner form
+#
+#    If the effective remote ref doesn't resolve (first push, no remote
+#    branch yet), there is "everything to gate" — do not bypass.
+if effective_remote_ref resolves AND no commits ahead of effective_remote_ref:
   exit 0  # nothing to gate
 
 # 1. Ledger must exist for this branch
