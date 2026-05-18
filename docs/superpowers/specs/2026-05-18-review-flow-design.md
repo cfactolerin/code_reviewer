@@ -1,7 +1,7 @@
 # Design — Review Scope, Re-Review Tracking, Auto-Trigger Hook, Dismissals
 
 **Date:** 2026-05-18
-**Status:** Approved (pending user review of this written spec)
+**Status:** Approved (rev 13, after 10 rounds of structured review)
 **Target version:** 0.4.0
 **Author:** Cris Factolerin (with Claude)
 
@@ -1452,7 +1452,7 @@ CLAUDE.md                                    ← UPDATED
 |---|---|
 | Brand-new repo, no `origin/main` | Base resolution fails; user passes `--base` |
 | Detached HEAD | Hook exits 0; start refuses |
-| No commits ahead + clean tree | Start exits "nothing to review"; hook exits 0 via §5.3 step 0 |
+| No commits ahead of `effective_remote_ref` | Hook exits 0 via §5.3 step 0 (local dirty state is irrelevant to push gating). `/code-reviewer:start` itself exits "nothing to review" only when HEAD has no commits ahead of its review base AND the worktree is clean — that's a separate review-time check |
 | Same HEAD reviewed twice with different worktree states | Gate matches on (head_sha, worktree_hash) tuple; latest matching entry decides (§5.3) |
 | Stale `.jira-cache/` and Full mode Jira fetch fails | Stale cache is preserved; warning written to `context/jira.warn` (§4.3) |
 | More than `keep_last_rounds` round dirs accumulated | Oldest timestamp dirs are pruned on next `/code-reviewer:start`; ledger/dismissals/cache untouched |
