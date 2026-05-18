@@ -205,7 +205,7 @@ Invariants:
   ```
 
   `TRACKED` and `UNTRACKED` are both empty iff the working tree is clean →
-  `worktree_hash = null`. Because `git diff HEAD --binary` includes
+  `worktree_hash = null`. Because `git diff --no-ext-diff --no-color --no-textconv --binary HEAD` includes
   base85-encoded binary content and the full text diff of modifications, two
   different working-tree edits to the same tracked file produce different
   TRACKED bytes and therefore different hashes. The earlier draft used
@@ -286,6 +286,9 @@ final report):
     "dismissed":        ["20260518-140000:F3"],
     "newly_introduced": ["F1"]
   },
+  "suppressed_by_dismissals": [
+    "src/db.rs:120:n_plus_1_query_in_load_users"
+  ],
   "linter_summary": {
     "rubocop": { "ran": true, "issues": 3 },
     "ruff":    { "ran": false, "reason": "binary not installed" }
@@ -322,6 +325,16 @@ Conventions:
     what showed up since last time).
   - "still present and not dismissed" is implicit: those are the items in
     `findings[]` with `carried_from` set.
+- `suppressed_by_dismissals` lists fingerprints the arbiter would have
+  flagged this round (either fresh in a Full review, or first-time in a
+  Delta round) but suppressed because they match an active dismissal in
+  `DISMISSALS.md`. This is **for visibility / auditability only** — these
+  do not appear in `findings[]` and don't count toward the verdict, but
+  the user can see what was filtered out so they can re-enable any
+  finding by removing the dismissal (which will then break the gate via
+  `dismissals_changed` and force a fresh review that includes it).
+  Fingerprints listed here must match real entries in `DISMISSALS.md`
+  (enforced by validation).
 - `linter_summary` and `tests` are presence/issue counts only — full output
   remains in the Markdown report.
 
@@ -514,9 +527,11 @@ Validation steps (run in this order):
    correct type:
    - Top-level: `round`, `verdict`, `head_sha`, `base_sha`, `findings`,
      `open_questions`, `regression` (with sub-keys `resolved`,
-     `dismissed`, `newly_introduced`, each an array of strings).
+     `dismissed`, `newly_introduced`, each an array of strings),
+     `suppressed_by_dismissals` (array of strings).
    - Each finding: `id`, `severity`, `category`, `file`,
-     `line` (number or `null`), `end_line` (number or `null`),
+     `line` (positive integer, **not null** — file-level findings use
+     `line: 1`), `end_line` (positive integer or `null`),
      `summary`, `fingerprint`, `reviewers_agreeing`,
      `carried_from` (string or `null`).
 3. **Enum constraints.** `verdict ∈ {APPROVE, APPROVE_WITH_COMMENTS,
@@ -536,6 +551,16 @@ Validation steps (run in this order):
    every `carried_from` reference must point to a real ID in
    `prior_findings.json`, and every ID in `regression.dismissed` must have
    a matching fingerprint in the current `DISMISSALS.md`.
+7. **Dismissal suppression (both modes).** For every entry in
+   `findings[]`:
+   - The finding's `fingerprint` must **not** match any active dismissal
+     in `DISMISSALS.md`. Match → validation fails (the arbiter violated
+     the suppression rule; on retry the arbiter is reminded explicitly).
+   For every entry in `suppressed_by_dismissals`:
+   - It must match a fingerprint present in `DISMISSALS.md`. No match →
+     validation fails (the arbiter cited a non-existent dismissal).
+   These rules apply to both Full and Delta reviews so dismissals are
+   honoured at the source of every report, not only via carry-forward.
 6. **Fingerprint plausibility.** Each `fingerprint` matches the pattern
    `<file>:<line>:<slug>` and is internally unique within the file.
 
@@ -596,8 +621,9 @@ model below is firm.)
 The gate proceeds in this order; the first short-circuit decides:
 
 ```
-# 0. Nothing-to-push bypass — no diff vs upstream and no dirty working tree
-if (no commits ahead of @{u} or origin/<branch>) AND worktree_hash == null:
+# 0. Nothing-to-push bypass — no commits ahead of the push's upstream.
+#    Local dirty state is irrelevant (push only ships commits).
+if no commits ahead of @{u} or origin/<branch>:
   exit 0  # nothing to gate
 
 # 1. Ledger must exist for this branch
@@ -616,25 +642,32 @@ def base_compatible(r):
   return git merge-base --is-ancestor r.base_sha current_base_sha
 
 # 3. Find entries matching state + base compatibility + clean review
+#    + dismissals match.
 #    `git push` only ships commits — never uncommitted work. So an approval
 #    authorises a push when the approval itself was of a CLEAN tree
-#    (worktree_hash == null). The CURRENT worktree state is irrelevant: a
-#    user may have unrelated uncommitted work locally that won't ship.
+#    (worktree_hash == null). The CURRENT worktree state is irrelevant.
+#    Dismissals affect verdicts, so the approval is only valid while the
+#    DISMISSALS.md is in the same state it was at review time.
+current_dismissals_hash = sha256(DISMISSALS.md contents) or null
 matching = [r for r in ledger.reviews
             if r.head_sha == current_head_sha
             and r.worktree_hash == null              # clean review only
+            and r.dismissals_hash == current_dismissals_hash
             and base_compatible(r)]
 
 if not matching:
   # Categorise the failure for a useful deny reason
-  same_head_any = [r for r in ledger.reviews if r.head_sha == current_head_sha]
-  same_head_clean = [r for r in same_head_any if r.worktree_hash == null]
+  same_head_any   = [r for r in ledger.reviews if r.head_sha == current_head_sha]
+  same_head_clean = [r for r in same_head_any  if r.worktree_hash == null]
+  same_head_clean_baseok = [r for r in same_head_clean if base_compatible(r)]
   if not same_head_any:
     deny("head_changed")
   elif not same_head_clean:
-    deny("commit_needed")   # HEAD was only reviewed with a dirty worktree
-  else:
+    deny("commit_needed")        # HEAD only reviewed with a dirty worktree
+  elif not same_head_clean_baseok:
     deny("base_drifted")
+  else:
+    deny("dismissals_changed")   # DISMISSALS.md changed since approval
 
 # 4. Latest matching entry decides
 latest = matching[-1]
@@ -691,6 +724,7 @@ Deny reason keys:
 | HEAD never reviewed at any state | `head_changed` |
 | HEAD was only reviewed with a dirty worktree (no clean approval exists) | `commit_needed` |
 | Base has commits not covered by the review | `base_drifted` |
+| `DISMISSALS.md` changed since the approval | `dismissals_changed` |
 | Latest matching entry's verdict is BLOCK or REQUEST_CHANGES | `not_approved` |
 
 > **Why no `worktree_changed`?** A dirty-tree review never authorises a
