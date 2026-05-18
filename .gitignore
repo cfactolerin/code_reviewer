@@ -1,0 +1,14 @@
+# Editor & OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Python bytecode (from local script sanity checks)
+__pycache__/
+*.pyc
+
+# Per-repo review outputs (the plugin writes here when run inside a project).
+# This repo shouldn't accumulate them either.
+tmp/
