@@ -68,6 +68,7 @@ Optional flags:
 ```
 /code-reviewer:start --ticket ABC-123          # override Jira key
 /code-reviewer:start --base origin/develop     # override base branch
+/code-reviewer:start --no-cleanup              # keep other branches' review folders
 /code-reviewer:start --ticket ABC-123 --base origin/release/v2
 ```
 
@@ -164,6 +165,15 @@ issues.
 The plugin auto-adds `tmp/code-reviews/` to your project's `.gitignore` on
 first run (idempotent — won't duplicate if it's already covered by `tmp/` or
 `tmp/code-reviews/`). You don't need to do this by hand.
+
+### Auto-cleanup
+
+On every run, the plugin removes any `tmp/code-reviews/<other-branch>/`
+folder so `tmp/` doesn't accumulate stale work when you switch branches. The
+**current branch's history is preserved** so the previous
+`FINAL_REVIEW_RESULTS.md` can feed into the regression check on the next
+run. Pass `--no-cleanup` to skip the sweep if you're inspecting another
+branch's prior review.
 
 ## Configuration
 

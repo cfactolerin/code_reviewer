@@ -1,7 +1,7 @@
 ---
 name: code-reviewer-start
-description: Non-interactive multi-agent review of the current branch vs its base. Runs Claude/Codex/Gemini/opencode in parallel, arbiter synthesises results, writes FINAL_REVIEW_RESULTS.md the implementing agent can act on, and hands off to the main session with a fix/skip prompt. Optional flags - --ticket <KEY> --base <ref>.
-argument-hint: "[--ticket <KEY>] [--base <ref>]"
+description: Non-interactive multi-agent review of the current branch vs its base. Runs Claude/Codex/Gemini/opencode in parallel, arbiter synthesises results, writes FINAL_REVIEW_RESULTS.md the implementing agent can act on, and hands off to the main session with a fix/skip prompt. Optional flags - --ticket <KEY> --base <ref> --no-cleanup.
+argument-hint: "[--ticket <KEY>] [--base <ref>] [--no-cleanup]"
 allowed-tools: ["Bash(*)", Read, Write, Grep, Glob, Agent, TaskCreate, TaskUpdate, TaskList, AskUserQuestion]
 ---
 
@@ -28,6 +28,9 @@ Optional flags inside `$ARGUMENTS`:
   branch name / commit messages)
 - `--base <ref>` — override the base branch (otherwise auto: upstream →
   origin/main → origin/master, unless `base_branch` is set in config)
+- `--no-cleanup` — keep stale `tmp/code-reviews/` folders from other
+  branches. Default is to remove them so the working tree stays clean; pass
+  this flag only if you are inspecting another branch's prior review.
 
 ## Preflight
 
@@ -56,11 +59,19 @@ and `completed` when done:
 
 **Update task 1 → in_progress.**
 
-Run the context script. Pass through the user's flags from `$ARGUMENTS`:
+Run the context script. Pass through the user's flags from `$ARGUMENTS`
+(any of `--ticket`, `--base`, `--no-cleanup`):
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/context.sh [--ticket <KEY>] [--base <ref>]
+${CLAUDE_PLUGIN_ROOT}/scripts/context.sh [--ticket <KEY>] [--base <ref>] [--no-cleanup]
 ```
+
+By default the script removes `tmp/code-reviews/<other-branch>/…` folders
+for every branch other than the current one. The current branch's history
+is preserved so the previous `FINAL_REVIEW_RESULTS.md` can be fed into the
+review for regression detection. If the script removes anything it prints
+a one-line note to stderr — surface that note to the user in your Phase 7
+hand-off summary if it appears.
 
 - Capture the **last line of stdout** — this is the absolute path to the
   round directory. Save it as `ROUND_DIR`.

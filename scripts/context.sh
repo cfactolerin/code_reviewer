@@ -20,10 +20,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 base_override=""
 ticket_override=""
+do_cleanup=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base_override="$2"; shift 2 ;;
     --ticket) ticket_override="$2"; shift 2 ;;
+    --no-cleanup) do_cleanup=0; shift ;;
     *) echo "context.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -54,10 +56,31 @@ fi
 
 BRANCH_SLUG=$(cr_branch_slug "$BRANCH")
 TS=$(date +%Y%m%d-%H%M%S)
-ROUND_DIR="$REPO_ROOT/tmp/code-reviews/$BRANCH_SLUG/$TS"
+REVIEWS_ROOT="$REPO_ROOT/tmp/code-reviews"
+ROUND_DIR="$REVIEWS_ROOT/$BRANCH_SLUG/$TS"
 CONTEXT_DIR="$ROUND_DIR/context"
 RESULTS_DIR="$ROUND_DIR/results"
 REPRO_DIR="$ROUND_DIR/repro"
+
+# Auto-cleanup: remove review folders for other branches so the tmp/ dir
+# doesn't accumulate stale work. Keep the current branch's history so the
+# next review can include the previous FINAL_REVIEW_RESULTS.md for the
+# regression check. Skip when --no-cleanup is passed.
+if [ "$do_cleanup" = "1" ] && [ -d "$REVIEWS_ROOT" ]; then
+  removed=()
+  for entry in "$REVIEWS_ROOT"/*; do
+    [ -d "$entry" ] || continue
+    name=$(basename "$entry")
+    if [ "$name" != "$BRANCH_SLUG" ]; then
+      rm -rf "$entry"
+      removed+=("$name")
+    fi
+  done
+  if [ ${#removed[@]} -gt 0 ]; then
+    echo "Cleanup: removed ${#removed[@]} stale branch review folder(s): ${removed[*]}" >&2
+  fi
+fi
+
 mkdir -p "$CONTEXT_DIR" "$RESULTS_DIR" "$REPRO_DIR"
 
 # Make sure the consumer repo ignores plugin output. Idempotent.
