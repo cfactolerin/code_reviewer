@@ -66,12 +66,18 @@ bash "$SCRIPTS/ledger.sh" render-md "$LEDGER" "$MD"
 assert_contains "$(cat "$MD")" "20260518-140000"
 assert_contains "$(cat "$MD")" "APPROVE"
 
+# --- append rejects malformed entry without overwriting the ledger ---
+backup=$(cat "$LEDGER")
+out=$(bash "$SCRIPTS/ledger.sh" append "$LEDGER" 'not-json' 2>&1) && rc=$? || rc=$?
+assert_exit "1" "$rc" "append should fail on malformed entry"
+assert_eq "$(cat "$LEDGER")" "$backup" "ledger should be unchanged after failed append"
+
 # --- lock acquire + release ---
 LOCK="$dir/.review-ledger.lock"
 bash "$SCRIPTS/ledger.sh" acquire-lock "$LOCK"
 [ -f "$LOCK" ] || { echo "FAIL: lock file should exist after acquire"; exit 1; }
 
-# second acquire should fail (file exists, owner alive)
+# second acquire should fail (file fresh, stale-override condition not met)
 out=$(bash "$SCRIPTS/ledger.sh" acquire-lock "$LOCK" 2>&1) && rc=$? || rc=$?
 assert_exit "1" "$rc" "second acquire should fail"
 assert_contains "$out" "in progress" "deny message"

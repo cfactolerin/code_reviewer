@@ -20,7 +20,11 @@ case "$cmd" in
     mkdir -p "$(dirname "$ledger")"
     tmp=$(mktemp)
     if [ -s "$ledger" ]; then
-      jq --argjson e "$entry" '.reviews += [$e]' "$ledger" > "$tmp"
+      jq --argjson e "$entry" '.reviews += [$e]' "$ledger" > "$tmp" || {
+        rm -f "$tmp"
+        echo "code-reviewer: ledger.sh append: jq failed" >&2
+        exit 1
+      }
     else
       # Initialise: pull branch/base_ref/jira_keys from the entry itself.
       jq --argjson e "$entry" '
@@ -31,14 +35,18 @@ case "$cmd" in
           jira_cached_at: null,
           reviews:        [$e]
         }
-      ' <<< '{}' > "$tmp"
+      ' <<< '{}' > "$tmp" || {
+        rm -f "$tmp"
+        echo "code-reviewer: ledger.sh append: jq failed" >&2
+        exit 1
+      }
     fi
     mv "$tmp" "$ledger"
     ;;
 
   list)
     ledger="${1:-}"
-    [ -n "$ledger" ] && [ -f "$ledger" ] || { echo "Usage: ledger.sh list <ledger.json>" >&2; exit 2; }
+    [ -n "$ledger" ] && [ -s "$ledger" ] || { echo "Usage: ledger.sh list <ledger.json>" >&2; exit 2; }
     jq -r '
       .reviews[] |
       "\(.timestamp)\t\(.type)\t\(.verdict)\thead=\(.head_sha[0:7])\tworktree=\((.worktree_hash // "clean")[0:8])"
