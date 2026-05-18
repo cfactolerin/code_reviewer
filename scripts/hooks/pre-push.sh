@@ -58,7 +58,7 @@ tokens=( $working )
 filtered=()
 for t in "${tokens[@]}"; do
   case "$t" in
-    --force|--force-with-lease|--force-with-lease=*) : ;;
+    -f|--force|--force-with-lease|--force-with-lease=*) : ;;
     *) filtered+=("$t") ;;
   esac
 done
@@ -136,7 +136,6 @@ branch_dir="$review_output_path/$repo_slug/$branch_slug"
 ledger="$branch_dir/.review-ledger.json"
 
 head_sha=$(git rev-parse HEAD)
-worktree_hash=$(cr_worktree_hash)
 dismissals_hash=$(cr_dismissals_hash "$branch_dir/DISMISSALS.md")
 current_base_sha=""
 [ -n "$remote_ref" ] && current_base_sha=$(git rev-parse --verify "$remote_ref" 2>/dev/null || echo "")
@@ -195,16 +194,27 @@ fi
 # Step 9: Categorise the failure.
 same_head_any=$(jq --arg h "$head_sha" '.reviews | map(select(.head_sha == $h)) | length' "$ledger")
 same_head_clean=$(jq --arg h "$head_sha" '.reviews | map(select(.head_sha == $h and .worktree_hash == null)) | length' "$ledger")
-same_head_clean_dism=$(jq --arg h "$head_sha" --arg d "$dismissals_hash" '
-  .reviews | map(select(.head_sha == $h and .worktree_hash == null and ((.dismissals_hash // null) == ($d | select(. != "") // null)))) | length
+
+# Compute same_head_clean_baseok: clean entries that are also base-compatible (shell loop; git not in jq).
+clean_entries=$(jq --arg h "$head_sha" '
+  .reviews | map(select(.head_sha == $h and .worktree_hash == null))
 ' "$ledger")
+clean_count=$(echo "$clean_entries" | jq 'length')
+same_head_clean_baseok=0
+for i in $(seq 0 $((clean_count - 1))); do
+  bs=$(echo "$clean_entries" | jq -r ".[$i].base_sha")
+  if [ -z "$current_base_sha" ] || [ "$bs" = "$current_base_sha" ] || \
+     git merge-base --is-ancestor "$bs" "$current_base_sha" 2>/dev/null; then
+    same_head_clean_baseok=$((same_head_clean_baseok + 1))
+  fi
+done
 
 if [ "$same_head_any" -eq 0 ]; then
   deny "head_changed" "Branch '$branch' has commits beyond the last reviewed HEAD."
 elif [ "$same_head_clean" -eq 0 ]; then
   deny "commit_needed" "Branch '$branch' was only reviewed with uncommitted changes. Commit them and re-run /code-reviewer:start --delta."
-elif [ "$same_head_clean_dism" -eq 0 ]; then
-  deny "dismissals_changed" "DISMISSALS.md has changed since the last approval. Re-run /code-reviewer:start --delta."
-else
+elif [ "$same_head_clean_baseok" -eq 0 ]; then
   deny "base_drifted" "The base ref has commits not covered by the prior review's base. Re-run /code-reviewer:start --full."
+else
+  deny "dismissals_changed" "DISMISSALS.md has changed since the last approval. Re-run /code-reviewer:start --delta."
 fi

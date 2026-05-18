@@ -51,6 +51,10 @@ jq '. + {auto_trigger:true}' "$CR_CONFIG_DIR/config.json" > /tmp/c.$$ && mv /tmp
 out=$(run_hook "CR_SKIP=1 git push origin feat")
 assert_eq "$?" "0"
 
+# 2b) CR_SKIP=1 exported as env var → silent allow
+out=$(CR_SKIP=1 run_hook "git push origin feat")
+assert_eq "$?" "0"
+
 # 3) Skip branches matching skip_branches → silent allow
 jq '. + {skip_branches:["feat"]}' "$CR_CONFIG_DIR/config.json" > /tmp/c.$$ && mv /tmp/c.$$ "$CR_CONFIG_DIR/config.json"
 out=$(run_hook "git push origin feat")
