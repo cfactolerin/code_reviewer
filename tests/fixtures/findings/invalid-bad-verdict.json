@@ -1,0 +1,6 @@
+{
+  "round":   "X", "verdict": "MAYBE", "confidence": "HIGH",
+  "head_sha":"a","base_sha":"b","findings":[],"open_questions":[],
+  "regression":{"resolved":[],"newly_introduced":[]},
+  "dismissed_active":[],"obsolete_dismissals":[]
+}

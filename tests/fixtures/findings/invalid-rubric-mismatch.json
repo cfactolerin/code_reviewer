@@ -1,0 +1,11 @@
+{
+  "round":"X","verdict":"APPROVE","confidence":"HIGH","head_sha":"a","base_sha":"b",
+  "findings":[
+    {"id":"F1","severity":"CRITICAL","category":"Bug","file":"x.py","line":1,
+     "end_line":null,"summary":"oops","fingerprint":"x.py:1:oops",
+     "reviewers_agreeing":["claude"],"carried_from":null}
+  ],
+  "open_questions":[],
+  "regression":{"resolved":[],"newly_introduced":["F1"]},
+  "dismissed_active":[],"obsolete_dismissals":[]
+}

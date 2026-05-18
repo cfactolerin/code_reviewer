@@ -1,0 +1,12 @@
+{
+  "round":   "20260518-140000",
+  "verdict": "APPROVE",
+  "confidence": "HIGH",
+  "head_sha": "abc123",
+  "base_sha": "f00ba8",
+  "findings": [],
+  "open_questions": [],
+  "regression": {"resolved": [], "newly_introduced": []},
+  "dismissed_active": [],
+  "obsolete_dismissals": []
+}
