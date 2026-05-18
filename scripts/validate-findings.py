@@ -82,11 +82,21 @@ def main():
                     "dismissed_active", "obsolete_dismissals"]
     require_keys(data, top_required, "top-level", errors)
 
-    findings = data.get("findings", [])
-    dismissed = data.get("dismissed_active", [])
-    obsolete = data.get("obsolete_dismissals", [])
-    regression = data.get("regression", {}) or {}
-    open_questions = data.get("open_questions", [])
+    def ensure_list(name, value, errs):
+        if isinstance(value, list):
+            return value
+        fail(errs, f"top-level: {name!r} must be an array (got {type(value).__name__})")
+        return []
+
+    findings        = ensure_list("findings",            data.get("findings"),            errors)
+    dismissed       = ensure_list("dismissed_active",    data.get("dismissed_active"),    errors)
+    obsolete        = ensure_list("obsolete_dismissals", data.get("obsolete_dismissals"), errors)
+    open_questions  = ensure_list("open_questions",      data.get("open_questions"),      errors)
+
+    regression = data.get("regression", {})
+    if not isinstance(regression, dict):
+        regression = {}
+        fail(errors, "top-level: 'regression' must be an object")
 
     # Per-finding required fields + types
     for i, f in enumerate(findings):
@@ -106,6 +116,23 @@ def main():
         if "id" in d and not ID_DISMISSED_RE.match(str(d.get("id", ""))):
             fail(errors, f"{where}: 'id' must match ^D[0-9]+$ (got {d.get('id')!r})")
 
+    # Rule 3 (continued): IDs unique within their array
+    seen_ids: set = set()
+    for i, f in enumerate(findings):
+        fid = f.get("id")
+        if isinstance(fid, str):
+            if fid in seen_ids:
+                fail(errors, f"findings[{i}]: duplicate id {fid!r}")
+            seen_ids.add(fid)
+
+    seen_ids = set()
+    for i, d in enumerate(dismissed):
+        did = d.get("id")
+        if isinstance(did, str):
+            if did in seen_ids:
+                fail(errors, f"dismissed_active[{i}]: duplicate id {did!r}")
+            seen_ids.add(did)
+
     # Rule 3: enums
     if data.get("verdict") not in VERDICTS:
         fail(errors, f"verdict: invalid value {data.get('verdict')!r}; must be one of {sorted(VERDICTS)}")
@@ -122,12 +149,16 @@ def main():
         if d.get("category") not in FINDING_CATEGORIES:
             fail(errors, f"dismissed_active[{i}].category: invalid value {d.get('category')!r}")
     for i, q in enumerate(open_questions):
+        where = f"open_questions[{i}]"
+        require_keys(q, ["id", "category", "file", "line", "summary"], where, errors)
+        if "line" in q and not (isinstance(q["line"], int) and q["line"] >= 1):
+            fail(errors, f"{where}: 'line' must be a positive integer")
         if q.get("category") not in OQ_CATEGORIES:
-            fail(errors, f"open_questions[{i}].category: invalid value {q.get('category')!r}")
+            fail(errors, f"{where}.category: invalid value {q.get('category')!r}")
 
     # Rule 4: verdict vs severity rubric (findings only)
     expected = expected_verdict(findings)
-    if data.get("verdict") and data["verdict"] != expected:
+    if data.get("verdict") in VERDICTS and data["verdict"] != expected:
         fail(errors, f"rubric mismatch: findings imply verdict {expected!r}, got {data['verdict']!r}")
 
     # Dismissals on disk
@@ -192,6 +223,36 @@ def main():
         dismissed_refs = {d.get("ref") for d in dismissed if d.get("ref")}
         resolved_refs = set((regression.get("resolved") or []))
         accounted = carried_refs | dismissed_refs | resolved_refs
+
+        # Build a set of valid prior refs for the inverse direction check.
+        valid_prior_refs: set = set()
+        for p in prior:
+            if "id" in p and "_round" in p:
+                valid_prior_refs.add(f"{p['_round']}:{p['id']}")
+            elif "ref_self" in p:
+                valid_prior_refs.add(p["ref_self"])
+
+        # Every carried_from / ref / regression.resolved must refer to a real prior entry.
+        for i, f in enumerate(findings):
+            cf = f.get("carried_from")
+            if cf is not None:
+                if not REF_RE.match(str(cf)):
+                    fail(errors, f"findings[{i}]: carried_from {cf!r} does not match <YYYYMMDD-HHMMSS>:F|D<n>")
+                elif cf not in valid_prior_refs:
+                    fail(errors, f"findings[{i}]: carried_from {cf!r} does not refer to a real prior entry")
+        for i, d in enumerate(dismissed):
+            r = d.get("ref")
+            if r is not None:
+                if not REF_RE.match(str(r)):
+                    fail(errors, f"dismissed_active[{i}]: ref {r!r} does not match <YYYYMMDD-HHMMSS>:F|D<n>")
+                elif r not in valid_prior_refs:
+                    fail(errors, f"dismissed_active[{i}]: ref {r!r} does not refer to a real prior entry")
+        for r in (regression.get("resolved") or []):
+            if not REF_RE.match(str(r)):
+                fail(errors, f"regression.resolved: {r!r} does not match <YYYYMMDD-HHMMSS>:F|D<n>")
+            elif r not in valid_prior_refs:
+                fail(errors, f"regression.resolved: {r!r} does not refer to a real prior entry")
+
         for p in prior:
             ref = None
             # Each prior entry must carry a stable ref. We synthesise from id+round here.
