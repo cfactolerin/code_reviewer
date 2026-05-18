@@ -116,21 +116,37 @@ Path resolution rules:
   `<repo-slug>/` are never touched by `/code-reviewer:start` — they contain
   `.review-ledger.json`, `DISMISSALS.md`, and `.jira-cache/` which must
   survive branch switches.
-- **Within-branch timestamp pruning** runs on every `/code-reviewer:start`
-  unless `--no-prune` is passed: enumerate timestamp directories on disk
-  (sorted by name, which equals chronological order since names are
-  `YYYYMMDD-HHMMSS`) and retain the most recent `keep_last_rounds`
-  (default `10`). Older timestamp dirs are removed. **Failed-review round
-  dirs count toward the quota** (they live on disk regardless of ledger
-  state; without this rule, failed dirs would leak forever). The
-  per-branch state files (ledger, dismissals, jira-cache) are never
-  affected.
+- **Within-branch timestamp pruning** runs as the **last step** of a
+  successful `/code-reviewer:start` (after the ledger entry is appended
+  and `findings.json` has been validated), unless `--no-prune` is passed.
+  Algorithm:
+  1. Enumerate timestamp directories on disk under `<branch-slug>/`,
+     sorted by name (which equals chronological order since names are
+     `YYYYMMDD-HHMMSS`).
+  2. Determine the set to **preserve**: the current round (just created),
+     the immediately-prior round (if one exists, so the next Delta can
+     read its `findings.json`), and the most recent
+     `keep_last_rounds - 2` rounds beyond those. Effective floor is 2
+     rounds preserved on any branch with prior history, regardless of
+     how low `keep_last_rounds` is set.
+  3. Remove all other timestamp dirs.
 
-- **`--no-prune`** skips the pruning step for the current `/code-reviewer:start`
-  run only. It does not change `keep_last_rounds`; the next run without
-  the flag prunes normally (which may remove rounds the prior `--no-prune`
-  run preserved). Useful when debugging or comparing several rounds
-  side-by-side.
+  **Failed-review round dirs count toward the quota** (they live on disk
+  regardless of ledger state; without this rule, failed dirs would leak
+  forever). The per-branch state files (ledger, dismissals, jira-cache)
+  are never affected.
+
+  **Why "last step":** pruning before reading the prior round's
+  `findings.json` would delete the very file Delta carry-forward needs.
+  Pruning before ledger append would mean a crash leaves stale dirs and
+  no ledger entry. Pruning after validation+ledger gives the cleanest
+  invariant: a successful run ends with a coherent state.
+
+- **`--no-prune`** skips the pruning step for the current
+  `/code-reviewer:start` run only. It does not change `keep_last_rounds`;
+  the next run without the flag prunes normally (which may remove rounds
+  the prior `--no-prune` run preserved). Useful when debugging or
+  comparing several rounds side-by-side.
 - A manual `/code-reviewer:cleanup` skill that nukes whole branch folders
   is **out of scope** for this design (see §13).
 
@@ -244,18 +260,37 @@ Invariants:
   `"rebase_detected"`).
 - `findings` counts come from the arbiter's final report; counts of *Findings*
   only (not Open Questions, not linter output).
-- Writes are atomic: write `.review-ledger.json.tmp` → `mv` into place. A
-  `.review-ledger.lock` (`flock` if available, else `mkdir`-based) guards
-  concurrent invocations. The lock file lives at
+- Writes are atomic: write `.review-ledger.json.tmp` → `mv` into place.
+  Concurrent invocations are guarded by a file-based lock at
   `<review_output_path>/<repo-slug>/<branch-slug>/.review-ledger.lock`.
 
-- **Lock lifecycle.** The orchestrator acquires the lock at the start of
-  `/code-reviewer:start` and releases it on exit via a shell trap so the
-  lock is freed on success, validation failure, REVIEW_FAILED, *and*
-  crash. Implementation: `trap 'rm -f "$LOCK_FILE" 2>/dev/null' EXIT
-  INT TERM`. If a stale lock is detected (PID owner gone, lock file
-  older than 1 hour), `/code-reviewer:start` removes it with a warning
-  and proceeds.
+- **Lock lifecycle.** The orchestrator acquires the lock via atomic file
+  creation:
+
+  ```bash
+  ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null || {
+    # Another run holds the lock. Check whether it's stale.
+    pid=$(cat "$LOCK_FILE" 2>/dev/null)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && \
+       [ "$(find "$LOCK_FILE" -mmin +60 2>/dev/null)" ]; then
+      # PID owner is gone AND file is >1h old → stale, take over.
+      rm -f "$LOCK_FILE"
+      ( set -o noclobber; echo $$ > "$LOCK_FILE" ) 2>/dev/null \
+        || exit_with "Could not acquire lock"
+    else
+      exit_with "Another review is in progress at <round_dir>"
+    fi
+  }
+  trap 'rm -f "$LOCK_FILE" 2>/dev/null' EXIT INT TERM
+  ```
+
+  The lock is a regular file (not a directory) — `rm -f` is sufficient
+  for cleanup. `set -o noclobber` makes the redirection fail (rather
+  than overwrite) if the file already exists, giving us atomic create.
+  This is portable across bash and zsh on macOS and Linux without
+  external dependencies (no `flock(1)` required). The trap releases
+  the lock on success, validation failure, `REVIEW_FAILED`, and any
+  signal-driven exit.
 
 `REVIEW_LEDGER.md` is rendered from the JSON on every ledger write — a table
 with one row per review entry plus a per-entry section showing verdict and
@@ -317,6 +352,12 @@ final report):
     "resolved":         ["20260518-140000:F1"],
     "newly_introduced": ["F1"]
   },
+  "obsolete_dismissals": [
+    {
+      "fingerprint": "src/legacy.rb:50:obsolete_lookup_path",
+      "reason":      "file removed in commit def456"
+    }
+  ],
   "dismissed_active": [
     {
       "id":          "D1",
@@ -374,6 +415,13 @@ Conventions:
     what showed up since last time).
   - "still present and not dismissed" is implicit: those are the items in
     `findings[]` with `carried_from` set.
+- `obsolete_dismissals` lists `DISMISSALS.md` fingerprints the arbiter
+  believes are **no longer applicable** (file removed, code rewritten,
+  reorganised so the original line no longer exists). Each entry has a
+  short `reason`. Informational for the user — they can clean up
+  `DISMISSALS.md` accordingly. Together with `dismissed_active[]`, every
+  fingerprint in `DISMISSALS.md` must be accounted for in **every
+  review** (Full and Delta both; enforced by §4.5 validation rule 9).
 - `dismissed_active` is the **authoritative store** of findings whose code
   still exists in the branch but is dismissed via `DISMISSALS.md`. Each
   entry has:
@@ -548,25 +596,25 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
 
    The arbiter is explicitly instructed:
 
-   > For each entry in `prior_findings.json`, re-verify it against the
-   > current branch state AND the current `DISMISSALS.md`. For each:
+   > For each entry in `prior_findings.json` (each has a `<prev_round>:<prev_id>`
+   > reference — `F<n>` for items from `prior.findings[]` or `D<n>` for items
+   > from `prior.dismissed_active[]`), re-verify it against the current
+   > branch state AND the current `DISMISSALS.md`. For each:
    >
    > - If the code at that file/line **no longer exhibits the issue** →
-   >   list its `<prev_round>:<prev_id>` in `regression.resolved`. If the
-   >   entry was previously dismissed (no `<prev_id>`, came from
-   >   `dismissed_active` with `ref: null`), use its fingerprint as the
-   >   reference: `"resolved:<fingerprint>"`.
+   >   list its `<prev_round>:<prev_id>` in `regression.resolved`.
    > - Else (issue still present):
    >   - If its fingerprint matches an active `DISMISSALS.md` entry →
    >     emit an entry in `dismissed_active[]` with the full finding
-   >     detail and `ref` set to its prior reference (preserving lineage).
+   >     detail and `ref: "<prev_round>:<prev_id>"` (preserving lineage).
    >   - Else (dismissal removed OR never dismissed) → emit a Finding in
-   >     `findings[]` with `carried_from` set to its prior reference.
+   >     `findings[]` with `carried_from: "<prev_round>:<prev_id>"`.
    >
    > Do not silently drop any prior entry. Every entry in
    > `prior_findings.json` must end up in **exactly one** of:
    > `findings[].carried_from`, `dismissed_active[]` (with matching `ref`),
-   > or `regression.resolved`.
+   > or `regression.resolved` — all using the same `<round>:<id>` reference
+   > shape.
 
    The arbiter is also told to scan the new material (new commits +
    uncommitted) for issues. New findings whose fingerprint matches an
@@ -625,8 +673,17 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
    `FINAL_REVIEW_RESULTS.md` from this branch goes in as secondary context
    for regression checking.
 4. Include `DISMISSALS.md` and previous Open Questions as in Delta.
-5. Run agents → arbiter → write `FINAL_REVIEW_RESULTS.md`.
-6. Append a `{"type": "full", ...}` ledger entry.
+5. **Dismissal accounting (also applies to Full).** The arbiter is told:
+   - For every fingerprint in `DISMISSALS.md`, decide:
+     - If the code at that file/line still exhibits the issue → emit a
+       `dismissed_active[]` entry with `ref: null` (or `ref: "<prev>:<id>"`
+       if a prior round carried it) and full finding detail.
+     - If the code no longer exhibits the issue → emit an
+       `obsolete_dismissals[]` entry with the fingerprint and a short
+       `reason`.
+   - No dismissal may be silently dropped (enforced by §4.5 rule 9).
+6. Run agents → arbiter → write `FINAL_REVIEW_RESULTS.md`.
+7. Append a `{"type": "full", ...}` ledger entry.
 
 ### 4.4 Multiple Jira keys
 
@@ -657,7 +714,8 @@ Validation steps (run in this order):
      `id`, `category`, `file`, `line`, `summary`),
      `regression` (object with `resolved` array-of-strings and
      `newly_introduced` array-of-strings),
-     `dismissed_active` (array of objects per §3.3).
+     `dismissed_active` (array of objects per §3.3),
+     `obsolete_dismissals` (array of `{fingerprint, reason}` objects per §3.3).
    - Top-level **optional**: `linter_summary` (object), `tests` (object).
      If omitted, treated as empty.
    - Each `findings[]` entry **required**: `id`, `severity`, `category`,
@@ -718,6 +776,16 @@ Validation steps (run in this order):
    `findings[]` and `dismissed_active[]` combined within a single
    `findings.json`. The same code issue cannot appear twice. Duplicate →
    validation fails.
+9. **DISMISSALS.md coverage (both modes).** Let
+   `D = {fingerprint | fingerprint ∈ DISMISSALS.md, parsed successfully
+   per §3.4}`. Every entry in `D` must appear in **exactly one** of:
+   - `dismissed_active[<entry>].fingerprint` (still present, suppressed), or
+   - `obsolete_dismissals[<entry>].fingerprint` (no longer applicable;
+     reason recorded).
+   The arbiter cannot silently drop a dismissed item; it must classify
+   each one. This rule applies in **both Full and Delta**. It's the
+   invariant that lets "remove a dismissal" → "next review resurrects the
+   issue" work consistently across review modes.
 
 On failure:
 
@@ -1367,8 +1435,9 @@ CLAUDE.md                                    ← UPDATED
   Claude Code plugin spec — verify via `claude-code-guide` agent when
   writing the plan.
 - Whether `hooks.json` lives in `.claude-plugin/` or `hooks/`.
-- Cross-platform `flock` availability on macOS (likely missing in base
-  system; use `mkdir`-based lock fallback).
+- (Resolved in rev 10: the lock is a regular file created via
+  `set -o noclobber; echo $$ > $LOCK_FILE`. Portable across macOS and
+  Linux without `flock(1)`. No mkdir fallback needed.)
 
 ## 13. Out of scope for this design
 
