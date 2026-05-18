@@ -870,7 +870,16 @@ The gate proceeds in this order; the first short-circuit decides:
 #                                     hook exits 0 silently and no
 #                                     derivation is attempted
 #
-#      `git push origin HEAD`                          → @{u}
+#      `git push origin HEAD`                          → origin/<current-branch>
+#                                                         (`HEAD` is a source-
+#                                                         only refspec; git
+#                                                         resolves it to the
+#                                                         current branch ref
+#                                                         and pushes to the
+#                                                         same-named remote
+#                                                         ref — NOT @{u},
+#                                                         which can point
+#                                                         elsewhere)
 #      `git push origin <current-branch>`              → origin/<current-branch>
 #      `git push origin HEAD:<current-branch>`         → origin/<current-branch>
 #      `git push -u origin <current-branch>` / --set-upstream
@@ -891,13 +900,22 @@ if effective_remote_ref resolves AND no commits ahead of effective_remote_ref:
 if not ledger.exists:
   deny("no_ledger")
 
-# 2. Compute the current base SHA before filtering, so base compatibility
-#    can be part of the matching predicate (not a post-filter).
-#    The hook uses its own resolution chain (no --base, no config lookup):
-#      current_base_ref = first of {@{u}, origin/main, origin/master, main, master} that resolves
-#      current_base_sha = git rev-parse <current_base_ref>   (empty if nothing resolves)
-current_base_ref = resolve_first(@{u}, origin/main, origin/master, main, master)
-current_base_sha = git rev-parse "$current_base_ref" 2>/dev/null  # empty for brand-new repo
+# 2. Compute the current base SHA for base-compatibility, using the same
+#    effective_remote_ref derived in step 0. The base-compatibility
+#    question is "did the prior review cover at least the commits this
+#    push will move?" — which is `HEAD vs effective_remote_ref`. So the
+#    base check must compare against the actual push target, not against
+#    some independent `@{u}` chain.
+#
+#      current_base_ref = effective_remote_ref (from step 0)
+#      current_base_sha = git rev-parse "$current_base_ref" 2>/dev/null
+#
+#    If effective_remote_ref doesn't resolve (first push, no remote ref
+#    yet), step 0 already exited "no bypass" — control flow reaches
+#    step 2 with no constraint to enforce. Set current_base_sha = empty
+#    and let base_compatible() return true (no comparison possible).
+current_base_ref = effective_remote_ref     # from step 0
+current_base_sha = git rev-parse "$current_base_ref" 2>/dev/null  # empty if first-push
 
 def base_compatible(r):
   if not current_base_sha:    # no upstream → skip base check
@@ -948,28 +966,29 @@ Notes on the base check:
   post-filter. This matters when the same `(head_sha, worktree_hash)` was
   reviewed against different bases: an older compatible approval is not
   ignored just because a newer incompatible review was logged.
-- **The hook and `context.sh` use different base-resolution chains** on
-  purpose:
+- **The hook and `context.sh` resolve `base_ref` differently** on purpose:
   - `context.sh` (review-time): `--base <ref>` flag → `config.base_branch`
     → `@{u}` → `origin/main` → `origin/master`. The user can target an
     arbitrary base for a review.
-  - **Hook (push-time):** `@{u}` (what `git push` actually targets) →
-    `origin/main` → `origin/master`. The hook never honours the historical
-    `--base` flag because it has no access to the slash command's arguments
-    — it can only see the current git state. This is intentional: the gate
-    must compare against what the push will move, not what the review
-    happened to target.
+  - **Hook (push-time):** uses the *push target* derived in step 0
+    (`effective_remote_ref`). The gate's job is "did the review cover what
+    the push will move?" so the comparison point must be the actual push
+    target — typically `@{u}` for a default `git push`, but
+    `origin/<current-branch>` for `git push origin HEAD`,
+    `git push origin <current-branch>`, or `push.default=current`. The
+    hook does NOT honour the historical `--base` flag.
 - Consequence: an ad-hoc `/code-reviewer:start --base origin/develop` whose
   result is then used to push to `origin/main` may produce a `base_drifted`
   deny if `origin/develop` is not an ancestor of `origin/main`. The
   operator fix is to either (a) set `config.base_branch` so the review
   consistently uses the same base the push will use, or (b) re-run the
-  review without `--base` so it picks up the upstream automatically.
+  review without `--base` so it picks up the resolved base automatically.
 - A review entry is **base-compatible** with the current state when its
   `base_sha` equals `current_base_sha` OR is an ancestor of it (i.e., the
   review covered at least what the push will move).
-- If the upstream / base ref has never existed locally (brand-new repo),
-  the base predicate returns true (no current_base_sha to compare against).
+- If the push target ref doesn't resolve (brand-new repo, first push to a
+  fresh branch), step 0 already exited "no bypass", so step 2 simply has
+  no constraint to enforce — `base_compatible()` returns true.
 
 Two important properties of this gate:
 
