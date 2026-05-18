@@ -116,11 +116,21 @@ Path resolution rules:
   `<repo-slug>/` are never touched by `/code-reviewer:start` — they contain
   `.review-ledger.json`, `DISMISSALS.md`, and `.jira-cache/` which must
   survive branch switches.
-- **Within-branch timestamp pruning** runs on every `/code-reviewer:start`:
-  retain the most recent `keep_last_rounds` round directories under
-  `<branch-slug>/` (default `10`, configurable). Older timestamp dirs are
-  removed. The per-branch state files (ledger, dismissals, jira-cache) are
-  never affected.
+- **Within-branch timestamp pruning** runs on every `/code-reviewer:start`
+  unless `--no-prune` is passed: enumerate timestamp directories on disk
+  (sorted by name, which equals chronological order since names are
+  `YYYYMMDD-HHMMSS`) and retain the most recent `keep_last_rounds`
+  (default `10`). Older timestamp dirs are removed. **Failed-review round
+  dirs count toward the quota** (they live on disk regardless of ledger
+  state; without this rule, failed dirs would leak forever). The
+  per-branch state files (ledger, dismissals, jira-cache) are never
+  affected.
+
+- **`--no-prune`** skips the pruning step for the current `/code-reviewer:start`
+  run only. It does not change `keep_last_rounds`; the next run without
+  the flag prunes normally (which may remove rounds the prior `--no-prune`
+  run preserved). Useful when debugging or comparing several rounds
+  side-by-side.
 - A manual `/code-reviewer:cleanup` skill that nukes whole branch folders
   is **out of scope** for this design (see §13).
 
@@ -162,8 +172,8 @@ Append-only timeline of reviews for the branch.
       "base_sha": "f00ba8...",
       "commits_reviewed": ["def456..."],
       "previous_head_sha": "abc123...",
-      "worktree_hash": "sha256:7f3e...",
-      "dismissals_hash": "sha256:a91b...",
+      "worktree_hash": "7f3e1c4d8b...",
+      "dismissals_hash": "a91b2e5f0c...",
       "verdict": "REQUEST_CHANGES",
       "findings": { "critical": 0, "high": 2, "medium": 1, "low": 0 },
       "open_questions": 1,
@@ -176,6 +186,10 @@ Append-only timeline of reviews for the branch.
 
 Invariants:
 
+- `jira_keys` (top-level on the ledger) = union of all Jira keys detected
+  on this branch across reviews. Updated on each ledger append (adding any
+  newly-detected keys). Informational only; the per-review keys aren't
+  re-recorded on each entry.
 - `head_sha` = `git rev-parse HEAD` at review start.
 - `base_ref` = the symbolic base used for this review (e.g. `origin/main`),
   exactly as resolved by the base resolver (see §5.3 notes for the two
@@ -205,13 +219,22 @@ Invariants:
   ```
 
   `TRACKED` and `UNTRACKED` are both empty iff the working tree is clean →
-  `worktree_hash = null`. Because `git diff --no-ext-diff --no-color --no-textconv --binary HEAD` includes
-  base85-encoded binary content and the full text diff of modifications, two
-  different working-tree edits to the same tracked file produce different
-  TRACKED bytes and therefore different hashes. The earlier draft used
-  `git status --porcelain=v2` which omits the working-tree blob SHA for
-  unstaged tracked changes (only `hH` and `hI` are emitted; there is no
-  `hW`) and was unsafe for unstaged edits.
+  `worktree_hash = null`.
+
+  **Canonical hash format**: hexadecimal digest string only (no
+  `"sha256:"` prefix). Examples: `"7f3e1c4d8b..."` (dirty),
+  `null` (clean). The same convention applies to `dismissals_hash`. All
+  comparisons elsewhere in the spec are string equality with `null`
+  treated as a distinct value (so `null == null` allowed, `null != "<hex>"`
+  denied, `"<hex1>" == "<hex2>"` byte-equal).
+
+  Because `git diff --no-ext-diff --no-color --no-textconv --binary HEAD`
+  includes base85-encoded binary content and the full text diff of
+  modifications, two different working-tree edits to the same tracked file
+  produce different TRACKED bytes and therefore different hashes. The
+  earlier draft used `git status --porcelain=v2` which omits the
+  working-tree blob SHA for unstaged tracked changes (only `hH` and `hI`
+  are emitted; there is no `hW`) and was unsafe for unstaged edits.
 - `previous_head_sha` (Delta) = `head_sha` of the prior review the Delta
   built on.
 - `dismissals_hash` = `sha256(<DISMISSALS.md contents>)` at review start, or
@@ -223,7 +246,16 @@ Invariants:
   only (not Open Questions, not linter output).
 - Writes are atomic: write `.review-ledger.json.tmp` → `mv` into place. A
   `.review-ledger.lock` (`flock` if available, else `mkdir`-based) guards
-  concurrent invocations.
+  concurrent invocations. The lock file lives at
+  `<review_output_path>/<repo-slug>/<branch-slug>/.review-ledger.lock`.
+
+- **Lock lifecycle.** The orchestrator acquires the lock at the start of
+  `/code-reviewer:start` and releases it on exit via a shell trap so the
+  lock is freed on success, validation failure, REVIEW_FAILED, *and*
+  crash. Implementation: `trap 'rm -f "$LOCK_FILE" 2>/dev/null' EXIT
+  INT TERM`. If a stale lock is detected (PID owner gone, lock file
+  older than 1 hour), `/code-reviewer:start` removes it with a warning
+  and proceeds.
 
 `REVIEW_LEDGER.md` is rendered from the JSON on every ledger write — a table
 with one row per review entry plus a per-entry section showing verdict and
@@ -275,7 +307,7 @@ final report):
   "open_questions": [
     {
       "id": "OQ1",
-      "category": "Intent ambiguity",
+      "category": "IntentAmbiguity",
       "file": "src/auth.rs",
       "line": 42,
       "summary": "Should expired tokens raise or return None?"
@@ -287,6 +319,7 @@ final report):
   },
   "dismissed_active": [
     {
+      "id":          "D1",
       "ref":         "20260518-140000:F3",
       "fingerprint": "src/db.rs:120:n_plus_1_query_in_load_users",
       "severity":    "HIGH",
@@ -297,6 +330,7 @@ final report):
       "summary":     "N+1 query in load_users"
     },
     {
+      "id":          "D2",
       "ref":         null,
       "fingerprint": "src/auth.rs:88:weak_password_check",
       "severity":    "HIGH",
@@ -341,23 +375,32 @@ Conventions:
   - "still present and not dismissed" is implicit: those are the items in
     `findings[]` with `carried_from` set.
 - `dismissed_active` is the **authoritative store** of findings whose code
-  still exists in the branch but is dismissed via `DISMISSALS.md`. Two
-  flavours, distinguished by `ref`:
-  - `ref: "<prev_round>:<prev_id>"` — a finding carried from a prior round
-    (either it was in `findings[]` of the prior round and is now dismissed,
-    or it was already in `dismissed_active` and remains).
-  - `ref: null` — a finding the arbiter would have flagged this round but
-    suppressed because it matches an active dismissal (Full mode fresh
-    catch, or first-time-in-Delta).
-  Every entry carries the full finding detail (severity, category, file,
-  line, summary, fingerprint) — not just an ID. This is critical: when the
-  user later removes a dismissal, Delta uses the carried structured detail
-  to re-verify the finding and either resurrect it into `findings[]` or
-  mark it `resolved`. Without the detail here, a removed dismissal could
-  silently allow the issue back into the codebase.
+  still exists in the branch but is dismissed via `DISMISSALS.md`. Each
+  entry has:
+  - `id` — stable per-round identifier, `D1`, `D2`, … assigned in order.
+    Used so `regression.resolved` and the next round's `ref` field can
+    address dismissed items the same way `F1`/`F2` address findings.
+  - `ref` — provenance:
+    - `"<prev_round>:<prev_id>"` (where `<prev_id>` is `F<n>` or `D<n>` of
+      the prior round) — a prior entry carried forward.
+    - `null` — first suppressed this round (Full mode fresh catch, or
+      first-time-in-Delta).
+  - Full finding detail (severity, category, file, line, summary,
+    fingerprint).
+
+  Carrying the structured detail is critical: when the user later removes
+  a dismissal, Delta uses the carried detail to re-verify and either
+  resurrect the finding into `findings[]` or mark it `resolved`. Without
+  the detail here, a removed dismissal could silently allow an issue back.
   Items here do **not** count toward the verdict (they are suppressed).
   Validation requires every fingerprint to match an actual
   `DISMISSALS.md` entry.
+
+**Prior reference forms (used by `carried_from`, `ref`, and
+`regression.resolved`):** always `"<round>:<id>"` where `<id>` is either
+`F<n>` (from prior `findings[]`) or `D<n>` (from prior `dismissed_active[]`).
+This unifies addressing — every prior entry has exactly one stable
+reference shape and validation can check it deterministically.
 - `linter_summary` and `tests` are presence/issue counts only — full output
   remains in the Markdown report.
 
@@ -384,15 +427,40 @@ Reason: Token is guaranteed non-null by the middleware at
 `src/middleware/auth.rs:18-22`. Reviewer didn't see the middleware.
 ```
 
+For multi-line findings (range), the heading uses `<file>:<start>-<end>` and
+the matching `dismissed_active` entry stores `line: <start>` and
+`end_line: <end>`:
+
+```markdown
+## src/db.rs:118-130 — Unsynchronised access to shared cache
+
+**Fingerprint:** `src/db.rs:118:unsynchronised_access_to_shared_cache`
+
+Dismissed: 2026-05-18
+Reason: The cache is only mutated during single-threaded startup; the
+multithreaded read-only phase doesn't need a lock.
+```
+
+Note the fingerprint always uses the start line (118 above), so dismissals
+remain stable across small range adjustments. `end_line` is metadata, not
+part of the fingerprint.
+
 **Parser rules:**
 
 1. Split the file into sections at each top-level `## ` heading. A section
    is everything from one `## ` heading up to the next (or EOF).
 2. For each section, find the first line matching the regex
    `^\*\*Fingerprint:\*\*\s+\`([^\`]+)\`\s*$`. The captured group is the
-   fingerprint. Sections without a `**Fingerprint:**` line are **ignored
-   with a warning** (logged to `context/dismiss.warn` in the round dir;
-   review continues without that dismissal applied).
+   fingerprint. Backticks around the fingerprint are required by the
+   strict parser; the helper script always emits them. If you hand-edit,
+   keep them. Sections without a `**Fingerprint:**` line (or with the
+   line malformed) are **ignored with a warning**.
+   - When a review is in progress (round dir exists): warning is logged
+     to `<round_dir>/context/dismiss.warn`.
+   - When the hook is computing `dismissals_hash`: the hook computes the
+     hash byte-wise over the file and does not parse sections, so
+     malformed sections do not affect the hook's gate decision. (They
+     will, however, affect any subsequent review run.)
 3. Fingerprint format: `<file>:<line>:<slug(summary)>` where
    `slug = lowercase, non-alphanumeric → '_'`. This matches the
    `fingerprint` field emitted by the arbiter in `findings.json` (§3.3).
@@ -438,10 +506,13 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
 2. **Prerequisite checks** (any failure → fallback to Full):
    - `git merge-base --is-ancestor prev.head_sha HEAD` (rebase detection;
      `fallback_reason: "rebase_detected"`)
-   - Resolve `current_base_sha = git rev-parse <current.base_ref>`. Require
-     `prev.base_sha == current_base_sha`; if not, the base shifted between
-     reviews and the Delta's scope would diverge from what the prior review
-     covered. Fall back to Full (`fallback_reason: "base_changed"`).
+   - Resolve `current_base_sha = git rev-parse <base_branch_ref>` where
+     `<base_branch_ref>` is determined by `context.sh`'s base resolution
+     chain (per §5.3 notes: `--base` flag → `config.base_branch` → `@{u}` →
+     `origin/main` → `origin/master`). Require `prev.base_sha ==
+     current_base_sha`; if not, the base shifted between reviews and the
+     Delta's scope would diverge from what the prior review covered. Fall
+     back to Full (`fallback_reason: "base_changed"`).
    - Verify `<prev.round_dir>/findings.json` exists and is readable. If
      missing (manual deletion or aggressive pruning below `keep_last_rounds`),
      fall back to Full (`fallback_reason: "prior_findings_missing"`).
@@ -461,11 +532,19 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
    In particular, **any change to `DISMISSALS.md` forces a real review** so
    the dismissal can affect the verdict and the gate.
 5. **Carry-forward unresolved findings** (the verdict-correctness gate).
-   Read the previous round's `findings.json` (per §3.3). The arbiter is
-   passed `prior_findings.json`, a single array that is the **union** of:
-   - `prev.findings[]` (each annotated with `_was_dismissed: false`)
-   - `prev.dismissed_active[]` (each annotated with `_was_dismissed: true`
-     and `_was_ref: <prev_ref>` if the prior entry had `ref != null`)
+   Parse the previous round's `findings.json` from disk
+   (`<prev.round_dir>/findings.json`, per §3.3). Throughout this step,
+   `prior = parsed findings.json from the prior round dir` (NOT the
+   ledger's `findings` counts object, which is a separate field
+   per §3.2). Build `prior_findings.json` as a single array that is the
+   union of:
+   - `prior.findings[]` (each annotated with `_was_dismissed: false`)
+   - `prior.dismissed_active[]` (each annotated with `_was_dismissed: true`)
+
+   Write `prior_findings.json` to the new round dir
+   (`<new_round_dir>/prior_findings.json`) before invoking the arbiter,
+   so both the arbiter and the §4.5 validator read the same on-disk
+   artifact (reproducibility + debuggability).
 
    The arbiter is explicitly instructed:
 
@@ -518,6 +597,12 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
 
 ### 4.3 Full mode
 
+> **First-ever Full on a branch** (no ledger yet): there is no prior round,
+> so `prior_findings.json` is **not written** to the new round dir, the
+> arbiter prompt does not include a "prior findings" section, and §4.5
+> rule 5 (carry-forward accounting) is **skipped**. Rules 1–4, 6, 7 still
+> apply.
+
 1. **Refresh Jira cache safely:**
    - Download every detected Jira key, its attachments, and all linked
      Confluence pages into `.jira-cache.new/`.
@@ -562,33 +647,55 @@ Validation steps (run in this order):
 
 1. **Parseable JSON.** Run `jq empty <round_dir>/findings.json`. If exit
    non-zero → fail.
-2. **Schema required fields.** Each required key from §3.3 present with
-   correct type:
-   - Top-level: `round`, `verdict`, `head_sha`, `base_sha`, `findings`,
-     `open_questions`, `regression` (with sub-keys `resolved` and
-     `newly_introduced`, each an array of strings), `dismissed_active`
-     (array of objects per §3.3).
-   - Each `findings[]` entry: `id`, `severity`, `category`, `file`,
-     `line` (positive integer, **not null** — file-level findings use
-     `line: 1`), `end_line` (positive integer or `null`),
-     `summary`, `fingerprint`, `reviewers_agreeing`,
+2. **Schema required fields.** Required keys from §3.3, with correct type.
+   "Required" means the key MUST be present (value may be `null` only
+   where explicitly noted). "Optional" means the key MAY be omitted; if
+   present it must have the documented type.
+   - Top-level **required**: `round` (string), `verdict` (string),
+     `confidence` (string), `head_sha` (string), `base_sha` (string),
+     `findings` (array), `open_questions` (array of objects, each with
+     `id`, `category`, `file`, `line`, `summary`),
+     `regression` (object with `resolved` array-of-strings and
+     `newly_introduced` array-of-strings),
+     `dismissed_active` (array of objects per §3.3).
+   - Top-level **optional**: `linter_summary` (object), `tests` (object).
+     If omitted, treated as empty.
+   - Each `findings[]` entry **required**: `id`, `severity`, `category`,
+     `file`, `line` (positive integer, **not null** — file-level findings
+     use `line: 1`), `end_line` (positive integer or `null`), `summary`,
+     `fingerprint`, `reviewers_agreeing` (array of strings),
      `carried_from` (string or `null`).
-   - Each `dismissed_active[]` entry: `ref` (string or `null`),
-     `fingerprint`, `severity`, `category`, `file`, `line` (positive
-     integer), `end_line` (positive integer or `null`), `summary`.
-3. **Enum constraints.** `verdict ∈ {APPROVE, APPROVE_WITH_COMMENTS,
-   REQUEST_CHANGES, BLOCK}`. `severity ∈ {CRITICAL, HIGH, MEDIUM, LOW}` in
-   both `findings[]` and `dismissed_active[]`. `confidence ∈ {HIGH,
-   MEDIUM, LOW}` if present.
+   - Each `dismissed_active[]` entry **required**: `id`, `ref` (string or
+     `null`), `fingerprint`, `severity`, `category`, `file`,
+     `line` (positive integer), `end_line` (positive integer or `null`),
+     `summary`.
+3. **Enum constraints.**
+   - `verdict ∈ {APPROVE, APPROVE_WITH_COMMENTS, REQUEST_CHANGES, BLOCK}`.
+   - `severity ∈ {CRITICAL, HIGH, MEDIUM, LOW}` in both `findings[]` and
+     `dismissed_active[]`.
+   - `confidence ∈ {HIGH, MEDIUM, LOW}`.
+   - `category` in `findings[]` and `dismissed_active[]` ∈
+     `{Bug, Security, Performance, Regression, TestCoverage, Style,
+       IntentMismatch, Other}`.
+   - `category` in `open_questions[]` ∈
+     `{IntentAmbiguity, MissingContext, ConflictingSignals,
+       OutOfScopeConcern}`. (Open questions are about ambiguity reasons;
+     findings are about defect types — separate enums.)
+   - Finding `id` matches regex `^F[0-9]+$`; `dismissed_active` `id`
+     matches `^D[0-9]+$`. IDs are unique within their array.
 4. **Verdict / severity consistency.** Apply the §7 rubric mechanically
    to `findings[]` only (`dismissed_active[]` does not count). The
    recorded `verdict` must equal the rubric output. Mismatch → fail.
-5. **Carry-forward accounting (Delta only).** Compute
-   `prior_findings = prev.findings ∪ prev.dismissed_active`. Every entry
-   must appear in **exactly one** of:
-   - new `findings[]` with `carried_from` set to its prior reference, or
+5. **Carry-forward accounting (Delta only).** Source: the
+   `<new_round_dir>/prior_findings.json` artifact written in §4.2 step 5
+   (union of `prior.findings[]` and `prior.dismissed_active[]` from the
+   parsed prior `findings.json`). Every entry must appear in **exactly
+   one** of:
+   - new `findings[]` with `carried_from` set to its prior reference
+     (`"<prev_round>:F<n>"` or `"<prev_round>:D<n>"`), or
    - new `dismissed_active[]` with `ref` set to its prior reference, or
-   - `regression.resolved` referencing its prior identifier.
+   - `regression.resolved` referencing the prior identifier in the same
+     `"<round>:<id>"` shape.
    No prior entry may be silently dropped or double-counted.
    Every `carried_from` value must point to a real prior reference, and
    every non-`null` `ref` in `dismissed_active[]` must point to a real
@@ -607,6 +714,10 @@ Validation steps (run in this order):
    `findings[]` and `dismissed_active[]` matches the pattern
    `<file>:<line>:<slug>` and the file+line+slug are internally
    consistent with the entry's own `file`, `line`, `summary` fields.
+8. **Within-round uniqueness.** Fingerprints must be unique across
+   `findings[]` and `dismissed_active[]` combined within a single
+   `findings.json`. The same code issue cannot appear twice. Duplicate →
+   validation fails.
 
 On failure:
 
@@ -688,7 +799,11 @@ if not ledger.exists:
 
 # 2. Compute the current base SHA before filtering, so base compatibility
 #    can be part of the matching predicate (not a post-filter).
-current_base_sha = git rev-parse <current.base_ref>  # may be empty for new repos
+#    The hook uses its own resolution chain (no --base, no config lookup):
+#      current_base_ref = first of {@{u}, origin/main, origin/master, main, master} that resolves
+#      current_base_sha = git rev-parse <current_base_ref>   (empty if nothing resolves)
+current_base_ref = resolve_first(@{u}, origin/main, origin/master, main, master)
+current_base_sha = git rev-parse "$current_base_ref" 2>/dev/null  # empty for brand-new repo
 
 def base_compatible(r):
   if not current_base_sha:    # no upstream → skip base check
@@ -800,12 +915,40 @@ Conceptual JSON output on stdout when denying:
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "code-reviewer: <reason>\n\nClaude, present these options via AskUserQuestion:\n  • Delta review\n  • Full review\n  • Skip review (push with CR_SKIP=1)\n  • Discuss\n\nThen run /code-reviewer:start with the appropriate flag and retry."
+    "permissionDecisionReason": "code-reviewer: <human_message>\n\n<orchestration_block>"
   }
 }
 ```
 
 On allow, exit 0 with no output.
+
+**`<human_message>` map** — substituted by the hook from the deny reason
+key (raw keys read poorly):
+
+| Deny reason key | `<human_message>` |
+|---|---|
+| `no_ledger` | "No prior review exists for branch `<branch>`. Run `/code-reviewer:start --full` first." |
+| `head_changed` | "Branch `<branch>` has commits beyond the last reviewed HEAD. The new commits have not been reviewed." |
+| `commit_needed` | "Branch `<branch>` was only reviewed with uncommitted changes in the working tree. Commit them and re-run `/code-reviewer:start --delta` so a clean approval exists." |
+| `base_drifted` | "The base ref (`<current_base_ref>`) has commits not covered by the prior review's base (`<prev_base_sha_short>`). Re-run `/code-reviewer:start --full`." |
+| `dismissals_changed` | "`DISMISSALS.md` has changed since the last approval. Re-run `/code-reviewer:start --delta` to re-evaluate." |
+| `not_approved` | "The latest matching review verdict is `<verdict>`. Address the findings or use `CR_SKIP=1 git push` to override." |
+
+**`<orchestration_block>`** is the fixed text below; the hook always emits
+this verbatim so Claude has a stable signal to detect:
+
+```
+Claude: present these options to the user via AskUserQuestion before
+retrying:
+
+  • Delta review (recommended — fast review of new material since last review)
+  • Full review (re-download Jira/Confluence; review entire branch)
+  • Skip review (push without review; retry with CR_SKIP=1)
+  • Discuss
+
+After the user picks, run /code-reviewer:start with the appropriate flag
+and retry the push. If "Skip" was chosen, retry with CR_SKIP=1 in env.
+```
 
 ### 5.5 Claude orchestration
 
@@ -893,7 +1036,7 @@ in their `## Open Questions` section:
 ```markdown
 ### OQ. <one-line summary>
 
-- **Category:** Intent ambiguity | Missing context | Conflicting signals | Out-of-scope concern
+- **Category:** `IntentAmbiguity` | `MissingContext` | `ConflictingSignals` | `OutOfScopeConcern` (per the §4.5 enum for `open_questions[]`)
 - **File:** `<path>:<line>` (if applicable)
 
 **The question:** <the question>
@@ -942,7 +1085,7 @@ to merge near-duplicates.
 ## Linter & Test Status
 - Linters: <list>
 - Tests: <command, result, failures>
-- Coverage gaps: <count>           ← count of findings whose Category is "Test Coverage"
+- Coverage gaps: <count>           ← count of findings whose `category` is `TestCoverage` (per the §4.5 enum)
 
 ## Intent Check vs Jira <KEY>
 Goal: <paraphrase>
@@ -966,6 +1109,51 @@ When the report has findings, append:
 
 > *To dismiss a finding as a false positive: ask me to dismiss it with a reason.*
 > *To undo a previous dismissal: ask me to remove it. Future reviews will be free to re-flag it.*
+
+### 6.2.1 Phase 7 rich-text — failure path
+
+When the §4.5 validation gate failed (no ledger entry was appended, a
+`REVIEW_FAILED.md` was written), Phase 7 does **not** render the standard
+template above. Instead it emits a tight failure report:
+
+```
+# Code review FAILED
+
+The arbiter produced output that failed validation. No ledger entry was
+written — the push gate will continue to deny.
+
+**Round dir:** <round_dir>
+**Failure marker:** <round_dir>/REVIEW_FAILED.md
+**Validation errors:** <round_dir>/validation-errors.md
+**Invalid arbiter output:** <round_dir>/findings.json.invalid
+
+**Mode attempted:** <Delta|Full>
+**Retries used:** <0 or 1>
+**First error:** <one-line summary from validation-errors.md>
+
+The most likely causes are:
+- The arbiter dropped or invented a finding ID
+- The arbiter cited a dismissal that doesn't exist in DISMISSALS.md
+- The arbiter emitted a finding whose fingerprint matches an active
+  dismissal (it should have suppressed the finding instead)
+- The recorded verdict doesn't match what the listed findings would
+  produce per the §7 rubric
+
+What to do next:
+- Re-run `/code-reviewer:start --full` to rebuild from scratch.
+- Inspect `<round_dir>/validation-errors.md` for the full list.
+- If you suspect a transient agent failure, retry first.
+```
+
+Then a single AskUserQuestion follow-up (hint to main session):
+
+> **What now?**
+
+Options:
+- **Retry as Full review** — invokes `/code-reviewer:start --full`.
+- **Inspect the failure** — opens the validation errors with the user.
+- **Skip this push** — user runs `CR_SKIP=1 git push` if they understand
+  the risk.
 
 ### 6.3 AskUserQuestion (hint to main session)
 
@@ -1074,7 +1262,7 @@ new keys default.
 |---|---|---|
 | `/code-reviewer:setup` | Changed | Adds the four new keys to the wizard (`review_output_path`, `auto_trigger`, `skip_branches`, `keep_last_rounds`) |
 | `/code-reviewer:start [--delta\|--full] [--ticket K] [--base R] [--no-prune]` | Changed | New `--delta` / `--full` mode flags; `--no-prune` skips within-branch timestamp pruning for this run (debugging / history preservation) |
-| `/code-reviewer:autodetect true\|false` | **New** | Toggle `auto_trigger`. Empty arg → print current |
+| `/code-reviewer:autodetect [true\|false]` | **New** | Toggle `auto_trigger`. No-arg form prints current state |
 | `/code-reviewer:dismiss add\|remove\|list ...` | **New** | Manage `DISMISSALS.md` for the current branch |
 | `/code-reviewer:add-agent <name>` | Unchanged | — |
 | `/code-reviewer:delete-agent <name>` | Unchanged | — |
@@ -1157,7 +1345,7 @@ CLAUDE.md                                    ← UPDATED
 | First-ever branch review | No ledger → Full |
 | `--delta` with no ledger | Error: run `--full` first |
 | Rebase / force-push in Delta | Auto-fallback to Full, `fallback_reason` recorded |
-| `git push --dry-run` | Gated normally; `CR_SKIP=1` to bypass |
+| `git push --dry-run` | Falls under the matching intercepted form (e.g. `git push` alone is gated only when `push.default ∈ {simple, current, upstream}`; an explicit-current-branch form is always gated). `--dry-run` itself doesn't change the interception decision. `CR_SKIP=1` bypasses |
 | Force push | Gated normally |
 | Push refspec to other branch (`git push origin local:other`) | **Not** intercepted (§5.7). User invokes `/code-reviewer:start` manually if they want review. Documented here for clarity |
 | Non-Claude shell pushes | Not intercepted (out of scope) |
