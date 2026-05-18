@@ -29,7 +29,7 @@ This design adds:
 7. **Explicit verdict rubric** — linters and Open Questions do not influence
    the verdict; only finding severity does.
 8. **Trunk-style workflow support** — drop hardcoded "main/master/develop is
-   protected" in favour of an opt-in `protected_branches` list.
+   protected" in favour of an opt-in `skip_branches` list.
 
 ## 2. Scope boundary
 
@@ -99,8 +99,19 @@ Path resolution rules:
   warning suggesting the user add it to `.gitignore` or
   `.git/info/exclude`. No auto-modification.
 
-Auto-cleanup of "other branches" folders applies inside
-`<review_output_path>/<repo-slug>/`. Other repos' folders are never touched.
+**Auto-cleanup policy (changed from v0.3.0):**
+
+- **Cross-branch auto-cleanup is removed.** Other branches' folders under
+  `<repo-slug>/` are never touched by `/code-reviewer:start` — they contain
+  `.review-ledger.json`, `DISMISSALS.md`, and `.jira-cache/` which must
+  survive branch switches.
+- **Within-branch timestamp pruning** runs on every `/code-reviewer:start`:
+  retain the most recent `keep_last_rounds` round directories under
+  `<branch-slug>/` (default `10`, configurable). Older timestamp dirs are
+  removed. The per-branch state files (ledger, dismissals, jira-cache) are
+  never affected.
+- A manual `/code-reviewer:cleanup` skill that nukes whole branch folders
+  is **out of scope** for this design (see §13).
 
 Worktrees naturally get distinct `<repo-slug>` directories because their
 `$REPO_ROOT` basenames differ. No cross-worktree pollution.
@@ -151,8 +162,24 @@ Invariants:
 - `head_sha` = `git rev-parse HEAD` at review start.
 - `commits_reviewed` for **Full** = every commit on the branch since base;
   for **Delta** = only commits not in any prior entry's `commits_reviewed`.
-- `worktree_hash` = `sha256(git diff HEAD ++ sorted untracked file contents)`,
-  or `null` if working tree clean.
+- `worktree_hash` is computed from a **deterministic manifest** of the working
+  tree state and is `null` when the tree is clean. Algorithm:
+
+  ```
+  # Tracked changes (captures modes, blob SHAs, deletions, symlinks)
+  TRACKED = git status --porcelain=v2 -z --untracked-files=no
+
+  # Untracked-file content hashes (respects .gitignore)
+  UNTRACKED = for each path in `git ls-files --others --exclude-standard -z`, sorted:
+                emit  "<path>\0<file_mode>\0<file_type>\0sha256(content)\n"
+
+  worktree_hash = sha256( TRACKED  +  "\0\0"  +  UNTRACKED )
+  ```
+
+  Resulting string is empty iff the tree is clean → `worktree_hash = null`.
+  Hash includes paths, modes, file types (symlink vs regular vs executable),
+  deletions (via porcelain v2 status), and content hashes. Two different
+  layouts cannot collide.
 - `previous_head_sha` (Delta) = `head_sha` of the prior review the Delta
   built on.
 - `fallback_reason` is set when Delta auto-falls-back to Full (e.g.,
@@ -206,32 +233,58 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
 ### 4.2 Delta mode
 
 1. Read ledger; locate most recent entry `prev`.
-2. Verify `prev.head_sha` is an ancestor of HEAD. If not → fallback to Full.
+2. Verify `prev.head_sha` is an ancestor of HEAD. If not → fallback to Full
+   (`fallback_reason: "rebase_detected"`).
 3. Compute "new material":
    - new commits = `git log prev.head_sha..HEAD --reverse`
-   - new worktree state = current `git diff HEAD` + untracked file contents
-   - hash both into `worktree_hash`.
+   - current `worktree_hash` per the manifest algorithm in §3.2.
 4. **Nothing-new short-circuit:** if there are zero new commits AND
    `worktree_hash == prev.worktree_hash`, exit early with
    `"Nothing new to review since <ts>; last verdict was <verdict>."` No new
    round directory, no ledger entry, no agent dispatch.
-5. Use cached Jira (`.jira-cache/<KEY>.md`) for any ticket already cached.
+5. **Carry-forward unresolved findings** (the verdict-correctness gate). Parse
+   `prev.FINAL_REVIEW_RESULTS.md`'s `## Detailed Findings` section. Each
+   finding has a file/line and a category. Build a `prior_unresolved.json`
+   passed to the arbiter alongside the new material. The arbiter is
+   explicitly instructed:
+
+   > For each prior finding in `prior_unresolved.json`, re-verify it against
+   > the current branch state (which now includes new commits and possibly a
+   > changed working tree). For each:
+   > - If the code at that file/line still exhibits the issue → include it in
+   >   the new report as a Finding (carried forward), with note "carried from
+   >   <prev round_dir>".
+   > - If the issue is no longer present → list it under the Regression
+   >   section as "Resolved since last review."
+   > - If the file no longer exists → list it as "No longer applicable
+   >   (file removed)."
+   >
+   > Do not silently drop prior findings.
+
+   This means the new Delta's verdict is computed from **all currently-present
+   findings (carried forward + new)**, not just findings the agents found in
+   the diff of new material.
+6. Use cached Jira (`.jira-cache/<KEY>.md`) for any ticket already cached.
    Only download missing tickets.
-6. Build the review prompt around **only the new material**, but include the
-   prior `FINAL_REVIEW_RESULTS.md` verbatim as regression context.
-7. Include `DISMISSALS.md` (if present) and the previous review's Open
+7. Build the review prompt around the new material, but include the prior
+   `FINAL_REVIEW_RESULTS.md` verbatim as regression context AND the
+   `prior_unresolved.json` for explicit re-verification.
+8. Include `DISMISSALS.md` (if present) and the previous review's Open
    Questions section (as "open" status — reviewers may flag the same OQ
    again if still unresolved, or note resolution if they detect it in the
    new material).
-8. Run agents → arbiter → write `FINAL_REVIEW_RESULTS.md`.
-9. Append a `{"type": "delta", ...}` ledger entry. Regenerate
-   `REVIEW_LEDGER.md`.
+9. Run agents → arbiter → write `FINAL_REVIEW_RESULTS.md`.
+10. Append a `{"type": "delta", ...}` ledger entry whose `findings` counts
+    reflect the **carried-forward + new** total. Regenerate
+    `REVIEW_LEDGER.md`.
 
 ### 4.3 Full mode
 
-1. **Refresh Jira cache:** delete `.jira-cache/` for this branch and
-   re-download every detected Jira key, its attachments, and all linked
-   Confluence pages. Update `jira_cached_at` in the ledger.
+1. **Refresh Jira cache safely:**
+   - Download every detected Jira key, its attachments, and all linked
+     Confluence pages into `.jira-cache.new/`.
+   - On success: `mv .jira-cache .jira-cache.old && mv .jira-cache.new .jira-cache && rm -rf .jira-cache.old`. Update `jira_cached_at` in the ledger.
+   - On any failure (HTTP error, timeout, partial content): `rm -rf .jira-cache.new`, keep the existing `.jira-cache/` in place, and log a warning into the round dir's `context/jira.warn` file: "Jira refresh failed at <ts>; using stale cache from <prev_cached_at>." Do not abort the review.
 2. Compute the full diff: `git diff <merge-base>...HEAD` + working-tree state.
 3. Build the review prompt around the entire branch diff. Any prior
    `FINAL_REVIEW_RESULTS.md` from this branch goes in as secondary context
@@ -269,31 +322,61 @@ model below is firm.)
 3. If `auto_trigger == false` → exit 0.
 4. If `CR_SKIP=1` is in the env → exit 0.
 5. Detect repo + branch. If not in a git repo → exit 0. If branch is in
-   `protected_branches` → exit 0.
+   `skip_branches` → exit 0.
 6. Resolve ledger path from `review_output_path` + repo-slug + branch-slug.
 7. Run gate conditions (Section 5.3). On pass → exit 0. On fail → deny with
    structured reason.
 
 ### 5.3 Gate conditions
 
-```
-current_head_sha = git rev-parse HEAD
-current_worktree_hash = sha256(diff HEAD + untracked) or null if clean
+The gate proceeds in this order; the first short-circuit decides:
 
-ledger exists
-  AND ledger has an entry with head_sha == current_head_sha
-  AND that latest matching entry's verdict ∈ {APPROVE, APPROVE_WITH_COMMENTS}
-  AND that entry's worktree_hash == current_worktree_hash
+```
+# 0. Nothing-to-push bypass — no diff vs upstream and no dirty working tree
+if (no commits ahead of @{u} or origin/<branch>) AND worktree_hash == null:
+  exit 0  # nothing to gate
+
+# 1. Ledger must exist for this branch
+if not ledger.exists:
+  deny("no_ledger")
+
+# 2. Find entries matching the FULL state tuple, not just HEAD
+matching = [r for r in ledger.reviews
+            if r.head_sha == current_head_sha
+            and r.worktree_hash == current_worktree_hash]
+
+if not matching:
+  if any(r.head_sha == current_head_sha for r in ledger.reviews):
+    deny("worktree_changed")   # HEAD was reviewed at a different worktree state
+  else:
+    deny("head_changed")        # HEAD itself has never been reviewed
+
+# 3. Latest matching entry's verdict decides
+latest = matching[-1]
+if latest.verdict in {APPROVE, APPROVE_WITH_COMMENTS}:
+  exit 0
+else:
+  deny("not_approved")
 ```
 
-If any check fails, deny with the specific reason:
+Two important properties of this gate:
+
+- **Matching on the (`head_sha`, `worktree_hash`) tuple** means a previously
+  approved clean state, then a dirty rejected state, then a return to clean
+  → allow. The most recent review of *this exact state* is what matters.
+- **Verdict reflects current findings** (because of the §4.2 carry-forward
+  rule). A Delta that produces APPROVE is asserting that no prior
+  finding remains unresolved. The gate doesn't need to walk the entire
+  history.
+
+Deny reason keys:
 
 | Failure | Reason key |
 |---|---|
 | Ledger missing | `no_ledger` |
-| HEAD not in ledger | `head_changed` |
-| Verdict not approved | `not_approved` |
-| Worktree changed since last review | `worktree_changed` |
+| HEAD never reviewed at any state | `head_changed` |
+| HEAD reviewed at different worktree state(s) | `worktree_changed` |
+| Latest matching entry's verdict is BLOCK or REQUEST_CHANGES | `not_approved` |
 
 ### 5.4 Hook output
 
@@ -333,10 +416,46 @@ loop until verdict is `APPROVE`. The plugin does not orchestrate this loop.
 |---|---|
 | `CR_SKIP=1 git push` | Single push |
 | `auto_trigger: false` in config | Global, until re-enabled via `/code-reviewer:autodetect true` |
-| `protected_branches: ["main", ...]` | Per-branch opt-out from the plugin entirely |
+| `skip_branches: ["main", ...]` | Per-branch opt-out from the plugin entirely |
 
 `CR_SKIP=1` is **not** recorded in the ledger. The absence of an approved
 ledger entry alongside a push tells that story implicitly.
+
+### 5.7 Supported push forms
+
+The hook only intercepts **simple** `git push` invocations from Claude's
+Bash tool. For anything else, it exits 0 silently — the user is doing
+something deliberate and the gate would be guessing.
+
+**Intercepted (gated):**
+
+- `git push`
+- `git push origin`
+- `git push origin <current-branch>`
+- `git push origin HEAD`
+- `git push -u origin <current-branch>` / `--set-upstream`
+- `git push --force` / `--force-with-lease` (no bypass — force still gates)
+- `git push --tags` (gated, since a tag push implies an associated commit chain)
+
+**Not intercepted (allowed silently):**
+
+- `git -C <path> push …`           ← different repo path
+- `cd <path> && git push …`        ← shell directory change before push
+- `git push <remote> <local>:<remote-ref>` where `<local>` is not HEAD or the current branch ← explicit refspec to a non-current branch
+- `git push <remote> <ref1> <ref2> …` ← multiple refspecs
+- `git push --delete origin <ref>`  ← branch deletion, not a content push
+- Any push command parsed via shell substitution Claude cannot statically analyse (e.g., `git push $(...)`)
+
+Rationale: detecting these reliably requires either re-implementing git's
+argument parser in the hook or running the command in dry-run mode (which
+has its own side effects). Both are over-engineering. If the user wants the
+gate to fire on a non-simple push, they re-arrange the command, or accept
+that the gate is bypassed and `/code-reviewer:start` can be run explicitly.
+
+When the hook intercepts but matches the "not intercepted" patterns, it
+emits a single-line stderr notice (`code-reviewer: not gating non-simple push
+form`) so the user knows the gate didn't run for this push. The push still
+proceeds.
 
 ## 6. Phase 7 hand-off & Open Questions
 
@@ -443,7 +562,10 @@ The arbiter is instructed:
 
 Rules baked into the arbiter prompt:
 
-- Verdict tier = highest unresolved finding severity.
+- Verdict tier = highest unresolved finding severity across **all currently
+  present findings**, including those carried forward from a prior review
+  (per §4.2 step 5). A Delta cannot APPROVE while any prior finding remains
+  unresolved against the current branch state.
 - **Linter output is never the basis for a finding's severity.** If a linter
   flag represents a real defect, the reviewer must argue the case
   independently as a Finding citing the same file/line; the linter output
@@ -458,8 +580,8 @@ Rules baked into the arbiter prompt:
 ## 8. Trunk-style workflow support
 
 Drop the hardcoded `main|master|develop` refusal in `context.sh`. Replace
-with `protected_branches: []` config (default empty). When the current
-branch is in `protected_branches`:
+with `skip_branches: []` config (default empty). When the current
+branch is in `skip_branches`:
 
 - `context.sh` refuses to run with a clear message.
 - Hook exits 0 silently.
@@ -488,7 +610,8 @@ Full `~/.code-reviewer/config.json` schema:
 
   "review_output_path": "/tmp/code-reviewer",
   "auto_trigger": true,
-  "protected_branches": [],
+  "skip_branches": [],
+  "keep_last_rounds": 10,
 
   "jira_base_url": "",
   "jira_email": "",
@@ -504,7 +627,7 @@ new keys default.
 | Slash command | Status | Purpose |
 |---|---|---|
 | `/code-reviewer:setup` | Changed | Adds the three new keys to the wizard |
-| `/code-reviewer:start [--delta\|--full] [--ticket K] [--base R] [--no-cleanup]` | Changed | New `--delta` / `--full` mode flags |
+| `/code-reviewer:start [--delta\|--full] [--ticket K] [--base R] [--no-prune]` | Changed | New `--delta` / `--full` mode flags; `--no-prune` skips within-branch timestamp pruning for this run (debugging / history preservation) |
 | `/code-reviewer:autodetect true\|false` | **New** | Toggle `auto_trigger`. Empty arg → print current |
 | `/code-reviewer:dismiss add\|remove\|list ...` | **New** | Manage `DISMISSALS.md` for the current branch |
 | `/code-reviewer:add-agent <name>` | Unchanged | — |
@@ -548,7 +671,7 @@ skills/
 
 scripts/
   lib.sh                                     ← UPDATED: review_output_path resolver, repo-slug, worktree-hash helpers
-  context.sh                                 ← UPDATED: drop hardcoded protected list, --delta/--full, new path layout, ledger append, read DISMISSALS, atomic write + lock
+  context.sh                                 ← UPDATED: drop hardcoded protected list, --delta/--full, new path layout, ledger append, read DISMISSALS, atomic write + lock, replace cross-branch cleanup with within-branch timestamp pruning (keep_last_rounds)
   prompt.sh                                  ← UPDATED: delta/full variants, include DISMISSALS, include previous OQs
   agents.sh                                  ← unchanged
   jira-fetch.py                              ← UPDATED: download attachments, save to .jira-cache/, full-mode flag forces re-download
@@ -579,7 +702,12 @@ CLAUDE.md                                    ← UPDATED
 |---|---|
 | Brand-new repo, no `origin/main` | Base resolution fails; user passes `--base` |
 | Detached HEAD | Hook exits 0; start refuses |
-| No commits ahead + clean tree | Start exits "nothing to review"; hook exits 0 |
+| No commits ahead + clean tree | Start exits "nothing to review"; hook exits 0 via §5.3 step 0 |
+| Same HEAD reviewed twice with different worktree states | Gate matches on (head_sha, worktree_hash) tuple; latest matching entry decides (§5.3) |
+| Stale `.jira-cache/` and Full mode Jira fetch fails | Stale cache is preserved; warning written to `context/jira.warn` (§4.3) |
+| More than `keep_last_rounds` round dirs accumulated | Oldest timestamp dirs are pruned on next `/code-reviewer:start`; ledger/dismissals/cache untouched |
+| `git -C <path> push` / `cd <path> && git push` / multi-refspec push | Hook exits 0 silently (§5.7); user invokes `/code-reviewer:start` manually if they want review |
+| Carried-forward finding is fixed by new diff | Arbiter lists it under Regression as "Resolved since last review" and drops from the new findings list (§4.2 step 5) |
 | First-ever branch review | No ledger → Full |
 | `--delta` with no ledger | Error: run `--full` first |
 | Rebase / force-push in Delta | Auto-fallback to Full, `fallback_reason` recorded |
@@ -587,7 +715,7 @@ CLAUDE.md                                    ← UPDATED
 | Force push | Gated normally |
 | Push refspec to other branch | Gated based on current HEAD; `CR_SKIP=1` to bypass |
 | Non-Claude shell pushes | Not intercepted (out of scope) |
-| Branch in `protected_branches` | Plugin refuses; hook exits 0 |
+| Branch in `skip_branches` | Plugin refuses; hook exits 0 |
 | Two worktrees, same branch | Divergent ledgers — documented as "don't do that" |
 | Repo-name collision | User sets explicit `review_output_path` |
 | Jira fetch failure | Continue without ticket context; error saved |
@@ -615,8 +743,11 @@ CLAUDE.md                                    ← UPDATED
 - Cross-branch dismissal inheritance (e.g., dismissals on a merged feature
   branch propagating to main).
 - Chunked review of very large diffs.
-- A `/code-reviewer:reset` or `/code-reviewer:cleanup-all` skill (auto-cleanup
-  on every run already handles the common case).
+- A `/code-reviewer:cleanup` skill that nukes whole branch folders or
+  cross-branch state. Within-branch timestamp pruning (controlled by
+  `keep_last_rounds`) handles routine accumulation; users who want to wipe
+  a branch's state can `rm -rf <review_output_path>/<repo-slug>/<branch>/`
+  manually. A dedicated cleanup skill can come in a later version.
 - Per-finding fingerprinting beyond `file:line + summary` — not needed for
   v1 dismissals.
 - Telemetry / observability (phase timing, agent cost reporting).
