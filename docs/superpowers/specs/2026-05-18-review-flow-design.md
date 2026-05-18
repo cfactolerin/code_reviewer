@@ -849,15 +849,41 @@ The gate proceeds in this order; the first short-circuit decides:
 #    HEAD has any commits ahead of it. Local dirty state is irrelevant.
 #
 #    effective_remote_ref derivation (matches the intercepted forms in §5.7):
-#      `git push` (with push.default ∈ {simple, current, upstream}) → @{u}
-#      `git push origin HEAD`                                        → @{u}
-#      `git push origin <current-branch>`                            → origin/<current-branch>
-#      `git push origin HEAD:<current-branch>`                       → origin/<current-branch>
-#      `git push -u origin <current-branch>` (--set-upstream)        → origin/<current-branch> if it exists, else "everything is new" (no bypass)
-#      `git push --force[-with-lease] <one of the above>`            → derive from the inner form
 #
-#    If the effective remote ref doesn't resolve (first push, no remote
-#    branch yet), there is "everything to gate" — do not bypass.
+#      `git push` (no args) — depends on push.default. Read once via
+#          `git config --get push.default` (treat empty/unset as `simple`,
+#          which is git's modern default).
+#        - push.default == simple   → @{u}    (git also requires upstream
+#                                              and current-branch names to
+#                                              match; if they don't, the
+#                                              push would fail anyway — the
+#                                              gate matches what would have
+#                                              been pushed had it worked)
+#        - push.default == upstream → @{u}
+#        - push.default == current  → origin/<current-branch>
+#                                     (NOT @{u} — `current` pushes to the
+#                                     remote ref of the same name as the
+#                                     local branch, regardless of where
+#                                     @{u} happens to point)
+#        - push.default == matching / nothing / anything else
+#                                   → NOT INTERCEPTED (per §5.7); the
+#                                     hook exits 0 silently and no
+#                                     derivation is attempted
+#
+#      `git push origin HEAD`                          → @{u}
+#      `git push origin <current-branch>`              → origin/<current-branch>
+#      `git push origin HEAD:<current-branch>`         → origin/<current-branch>
+#      `git push -u origin <current-branch>` / --set-upstream
+#                                                       → origin/<current-branch>
+#                                                         if it exists, else
+#                                                         "everything is new"
+#                                                         (no bypass)
+#      `git push --force[-with-lease] <inner-form>`    → derive from the
+#                                                         inner form
+#
+#    If the effective remote ref doesn't resolve (first push to this
+#    branch, no remote ref yet), there is "everything to gate" — do not
+#    bypass.
 if effective_remote_ref resolves AND no commits ahead of effective_remote_ref:
   exit 0  # nothing to gate
 
@@ -1060,11 +1086,13 @@ current branch's HEAD:
 - `git push origin HEAD:<current-branch>`       ← explicit src=HEAD
 - `git push --force` / `--force-with-lease` when combined with one of the
   above explicit forms                          ← force still gates
-- `git push` (no args) **only when** `git config push.default` resolves to
-  one of `simple` (default in modern git), `current`, or `upstream`. The
-  hook reads `push.default` once and intercepts only if the value is in
-  this allow-list. Other values (`matching`, `nothing`, etc.) → not
-  intercepted.
+- `git push` (no args) **only when** `git config --get push.default`
+  resolves to one of `simple`, `current`, or `upstream`. Treat empty /
+  unset as `simple` (git's modern default). The hook reads
+  `push.default` once and intercepts only if the resolved value is in
+  this allow-list. The push target derivation differs by value (see
+  §5.3 step 0 for the full mapping). Other values (`matching`,
+  `nothing`, deprecated `tracking`, etc.) → not intercepted.
 
 **Not intercepted (allowed silently)** — anywhere the gate would be guessing:
 
@@ -1393,9 +1421,10 @@ CLAUDE.md                                    ← UPDATED
 
 - **Multiple Jira keys:** fetch all distinct keys; cache each separately;
   prompt includes all under `## Jira Context`.
-- **Concurrent runs:** atomic ledger writes + a per-branch lock (`flock`
-  with `mkdir` fallback). Second runner sees "another review is in progress
-  at <round_dir>" and exits.
+- **Concurrent runs:** atomic ledger writes + a per-branch file lock
+  created via `set -o noclobber; echo $$ > $LOCK_FILE` (see §3.2 for the
+  full lifecycle). Second runner sees "another review is in progress at
+  `<round_dir>`" and exits.
 - **Missing or malformed config when hook fires:** hook exits 0 silently.
 
 ### Documented behaviour (no extra design needed)
