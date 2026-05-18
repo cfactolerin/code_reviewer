@@ -64,7 +64,18 @@ main session** — the plugin takes no action on it.
 ### 3.1 Storage layout
 
 A new config key `review_output_path` (default `/tmp/code-reviewer`) controls
-where reviews go. Resolved round directory:
+where reviews go.
+
+> **Volatility note.** The default `/tmp/code-reviewer` is convenient (no
+> repo pollution, no setup) but **not durable**: most OSes wipe `/tmp` on
+> reboot, and macOS purges files there periodically. That means the per-
+> branch ledger, `DISMISSALS.md`, and `.jira-cache/` can disappear without
+> warning. Users who care about persistence (dismissals especially) should
+> set `review_output_path` to a durable path like `~/.cache/code-reviewer`
+> via `/code-reviewer:setup` or by editing `~/.code-reviewer/config.json`.
+> The setup wizard explicitly surfaces this trade-off.
+
+Resolved round directory:
 
 ```
 <review_output_path>/<repo-slug>/<branch-slug>/<timestamp>/
@@ -123,7 +134,7 @@ Append-only timeline of reviews for the branch.
 ```json
 {
   "branch": "feat_auth",
-  "base": "origin/main",
+  "base_ref": "origin/main",
   "jira_keys": ["ABC-123", "ABC-124"],
   "jira_cached_at": "2026-05-18T14:00:00Z",
   "reviews": [
@@ -131,6 +142,8 @@ Append-only timeline of reviews for the branch.
       "timestamp": "20260518-140000",
       "type": "full",
       "head_sha": "abc123...",
+      "base_ref": "origin/main",
+      "base_sha": "f00ba8...",
       "commits_reviewed": ["abc123..."],
       "previous_head_sha": null,
       "worktree_hash": null,
@@ -144,6 +157,8 @@ Append-only timeline of reviews for the branch.
       "timestamp": "20260518-153000",
       "type": "delta",
       "head_sha": "def456...",
+      "base_ref": "origin/main",
+      "base_sha": "f00ba8...",
       "commits_reviewed": ["def456..."],
       "previous_head_sha": "abc123...",
       "worktree_hash": "sha256:7f3e...",
@@ -160,14 +175,20 @@ Append-only timeline of reviews for the branch.
 Invariants:
 
 - `head_sha` = `git rev-parse HEAD` at review start.
-- `commits_reviewed` for **Full** = every commit on the branch since base;
-  for **Delta** = only commits not in any prior entry's `commits_reviewed`.
+- `base_ref` = the symbolic base used for this review (e.g. `origin/main`),
+  exactly as resolved by `cr_base_branch` or as the user passed via `--base`.
+- `base_sha` = `git rev-parse <base_ref>` at review start. The SHA pins the
+  base independently of the symbolic name (which can move).
+- `commits_reviewed` for **Full** = every commit on the branch since
+  `base_sha`; for **Delta** = only commits not in any prior entry's
+  `commits_reviewed`.
 - `worktree_hash` is computed from a **deterministic manifest** of the working
   tree state and is `null` when the tree is clean. Algorithm:
 
   ```
-  # Tracked changes (captures modes, blob SHAs, deletions, symlinks)
-  TRACKED = git status --porcelain=v2 -z --untracked-files=no
+  # Tracked changes — full content diff vs HEAD, including binary, deletions,
+  # mode changes, symlink target changes. Combines staged + unstaged.
+  TRACKED = git diff HEAD --binary
 
   # Untracked-file content hashes (respects .gitignore)
   UNTRACKED = for each path in `git ls-files --others --exclude-standard -z`, sorted:
@@ -176,10 +197,14 @@ Invariants:
   worktree_hash = sha256( TRACKED  +  "\0\0"  +  UNTRACKED )
   ```
 
-  Resulting string is empty iff the tree is clean → `worktree_hash = null`.
-  Hash includes paths, modes, file types (symlink vs regular vs executable),
-  deletions (via porcelain v2 status), and content hashes. Two different
-  layouts cannot collide.
+  `TRACKED` and `UNTRACKED` are both empty iff the working tree is clean →
+  `worktree_hash = null`. Because `git diff HEAD --binary` includes
+  base85-encoded binary content and the full text diff of modifications, two
+  different working-tree edits to the same tracked file produce different
+  TRACKED bytes and therefore different hashes. The earlier draft used
+  `git status --porcelain=v2` which omits the working-tree blob SHA for
+  unstaged tracked changes (only `hH` and `hI` are emitted; there is no
+  `hW`) and was unsafe for unstaged edits.
 - `previous_head_sha` (Delta) = `head_sha` of the prior review the Delta
   built on.
 - `fallback_reason` is set when Delta auto-falls-back to Full (e.g.,
@@ -194,7 +219,99 @@ Invariants:
 with one row per review entry plus a per-entry section showing verdict and
 finding counts. Never edited by hand.
 
-### 3.3 `DISMISSALS.md`
+### 3.3 `findings.json` (per round)
+
+Every round directory contains, next to `FINAL_REVIEW_RESULTS.md`, a machine-
+readable `findings.json` the arbiter emits. This is the **authoritative
+source** for carry-forward verification, dismissal matching, and any other
+machine consumer. The Markdown report is for humans only — never parsed.
+
+Schema (one file per round; emitted by the arbiter as part of producing the
+final report):
+
+```json
+{
+  "round": "20260518-153000",
+  "verdict": "REQUEST_CHANGES",
+  "confidence": "HIGH",
+  "head_sha": "def456...",
+  "base_sha": "f00ba8...",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "CRITICAL",
+      "category": "Bug",
+      "file": "src/auth.rs",
+      "line": 42,
+      "end_line": null,
+      "summary": "missing null check on session token",
+      "fingerprint": "src/auth.rs:42:missing_null_check_on_session_token",
+      "reviewers_agreeing": ["claude", "codex"],
+      "carried_from": null
+    },
+    {
+      "id": "F2",
+      "severity": "HIGH",
+      "category": "Bug",
+      "file": "src/db.rs",
+      "line": 120,
+      "end_line": null,
+      "summary": "N+1 query in load_users",
+      "fingerprint": "src/db.rs:120:n_plus_1_query_in_load_users",
+      "reviewers_agreeing": ["claude", "gemini"],
+      "carried_from": "20260518-140000:F4"
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "OQ1",
+      "category": "Intent ambiguity",
+      "file": "src/auth.rs",
+      "line": 42,
+      "summary": "Should expired tokens raise or return None?"
+    }
+  ],
+  "regression": {
+    "resolved": ["20260518-140000:F1"],
+    "still_present": ["20260518-140000:F4"],
+    "newly_introduced": ["F1"]
+  },
+  "linter_summary": {
+    "rubocop": { "ran": true, "issues": 3 },
+    "ruff":    { "ran": false, "reason": "binary not installed" }
+  },
+  "tests": {
+    "command": "bundle exec rspec",
+    "ran": true,
+    "passed": false,
+    "failures": [
+      { "test": "spec/models/user_spec.rb:42", "reason": "expected nil, got 0" }
+    ]
+  }
+}
+```
+
+Conventions:
+
+- **Stable IDs per round:** `F1`, `F2`, … assigned in order they appear in
+  the report. References across rounds use `<round>:<id>` form, e.g.
+  `20260518-140000:F4`.
+- **`fingerprint`** = `<file>:<line>:<slug(summary)>` (lowercase, non-alnum →
+  `_`). Used by `DISMISSALS.md` matching and by Delta carry-forward to
+  identify the "same" finding across rounds.
+- **`carried_from`** is `null` for findings raised fresh this round;
+  `"<prev_round>:<prev_id>"` when the finding was carried forward from a
+  prior round during a Delta's re-verification.
+- `regression` lists round-relative IDs from the previous review entry
+  (`resolved`, `still_present`) plus this round's IDs for `newly_introduced`.
+- `linter_summary` and `tests` are presence/issue counts only — full output
+  remains in the Markdown report.
+
+The arbiter is told: emit `findings.json` strictly per this schema, then
+emit `FINAL_REVIEW_RESULTS.md` as a human-readable rendering of the same
+data. If the two disagree, `findings.json` is authoritative.
+
+### 3.4 `DISMISSALS.md`
 
 Free-form Markdown, one `## <file>:<line> — <summary>` heading per dismissed
 finding, with a body capturing date and reason. Reviewer agents are told to
@@ -242,28 +359,28 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
    `worktree_hash == prev.worktree_hash`, exit early with
    `"Nothing new to review since <ts>; last verdict was <verdict>."` No new
    round directory, no ledger entry, no agent dispatch.
-5. **Carry-forward unresolved findings** (the verdict-correctness gate). Parse
-   `prev.FINAL_REVIEW_RESULTS.md`'s `## Detailed Findings` section. Each
-   finding has a file/line and a category. Build a `prior_unresolved.json`
-   passed to the arbiter alongside the new material. The arbiter is
-   explicitly instructed:
+5. **Carry-forward unresolved findings** (the verdict-correctness gate).
+   Read the previous round's `findings.json` (per §3.3). The arbiter is
+   passed `prior_findings.json` (a copy of `prev.findings.json`'s
+   `findings` array) and is explicitly instructed:
 
-   > For each prior finding in `prior_unresolved.json`, re-verify it against
-   > the current branch state (which now includes new commits and possibly a
-   > changed working tree). For each:
-   > - If the code at that file/line still exhibits the issue → include it in
-   >   the new report as a Finding (carried forward), with note "carried from
-   >   <prev round_dir>".
-   > - If the issue is no longer present → list it under the Regression
-   >   section as "Resolved since last review."
-   > - If the file no longer exists → list it as "No longer applicable
-   >   (file removed)."
+   > For each entry in `prior_findings.json`, re-verify it against the
+   > current branch state. For each:
+   > - If the code at that file/line still exhibits the issue → emit a
+   >   Finding in `findings.json` with `carried_from: "<prev_round>:<prev_id>"`.
+   > - If the issue is no longer present → list its `<prev_round>:<prev_id>`
+   >   in `regression.resolved`.
+   > - If the file no longer exists → list it in `regression.resolved` with
+   >   a note "(file removed)" in the human-readable report.
    >
-   > Do not silently drop prior findings.
+   > Do not silently drop prior findings. Every entry in `prior_findings.json`
+   > must end up in either the new `findings` array (with `carried_from` set)
+   > or `regression.resolved`.
 
    This means the new Delta's verdict is computed from **all currently-present
    findings (carried forward + new)**, not just findings the agents found in
-   the diff of new material.
+   the diff of new material. Because `findings.json` is structured, the
+   carry-forward verification is deterministic — no Markdown parsing.
 6. Use cached Jira (`.jira-cache/<KEY>.md`) for any ticket already cached.
    Only download missing tickets.
 7. Build the review prompt around the new material, but include the prior
@@ -317,10 +434,18 @@ model below is firm.)
 ### 5.2 Hook flow
 
 1. Read stdin JSON; extract the command. If not a `git push` → exit 0.
-2. Read `~/.code-reviewer/config.json`. If missing/malformed → **exit 0
+2. **Parse leading env assignments** off the command text. A command like
+   `CR_SKIP=1 git push origin feat-X` has `CR_SKIP=1` as part of the
+   command string, not the hook's own environment (the hook fires before
+   Bash evaluates the command). The hook strips leading `KEY=VALUE`
+   tokens from the command and, if `CR_SKIP=1` is among them, **exits 0**.
+   Supported form: env assignments must precede the `git` token, e.g.
+   `CR_SKIP=1 git push …` or `CR_SKIP=1 OTHER=2 git push …`. The hook
+   also honours `CR_SKIP=1` set via `export` in a prior turn (it appears in
+   the hook's own env then).
+3. Read `~/.code-reviewer/config.json`. If missing/malformed → **exit 0
    silently** (don't gate users who haven't set up).
-3. If `auto_trigger == false` → exit 0.
-4. If `CR_SKIP=1` is in the env → exit 0.
+4. If `auto_trigger == false` → exit 0.
 5. Detect repo + branch. If not in a git repo → exit 0. If branch is in
    `skip_branches` → exit 0.
 6. Resolve ledger path from `review_output_path` + repo-slug + branch-slug.
@@ -351,13 +476,36 @@ if not matching:
   else:
     deny("head_changed")        # HEAD itself has never been reviewed
 
-# 3. Latest matching entry's verdict decides
+# 3. Base coverage — the review's base must cover what the push will diff
+#    against. Otherwise commits in the current upstream that weren't in the
+#    review's base are unreviewed material.
+current_base_sha = git rev-parse <current.cr_base_branch>
 latest = matching[-1]
+if latest.base_sha != current_base_sha:
+  if not git merge-base --is-ancestor latest.base_sha current_base_sha:
+    deny("base_drifted")  # current base has commits not covered by the review
+
+# 4. Verdict decides
 if latest.verdict in {APPROVE, APPROVE_WITH_COMMENTS}:
   exit 0
 else:
   deny("not_approved")
 ```
+
+Notes on the base check:
+
+- The hook resolves the current base ref the same way `context.sh` does
+  (`--base` override → `cr_base_branch` config → `@{u}` → `origin/main` →
+  `origin/master`).
+- If `latest.base_sha == current_base_sha`, the base is identical — skip
+  the ancestor check.
+- If `latest.base_sha` is an ancestor of `current_base_sha`, the review
+  covered a superset of what the push will move — safe to allow.
+- If `latest.base_sha` is unrelated to or a descendant of
+  `current_base_sha`, the review covered too little — deny.
+- If the upstream / base ref has never existed locally (brand-new repo),
+  the base check is skipped (no current_base_sha to compare against) and
+  step 4 proceeds.
 
 Two important properties of this gate:
 
@@ -376,6 +524,7 @@ Deny reason keys:
 | Ledger missing | `no_ledger` |
 | HEAD never reviewed at any state | `head_changed` |
 | HEAD reviewed at different worktree state(s) | `worktree_changed` |
+| Base has commits not covered by the review | `base_drifted` |
 | Latest matching entry's verdict is BLOCK or REQUEST_CHANGES | `not_approved` |
 
 ### 5.4 Hook output
@@ -427,24 +576,36 @@ The hook only intercepts **simple** `git push` invocations from Claude's
 Bash tool. For anything else, it exits 0 silently — the user is doing
 something deliberate and the gate would be guessing.
 
-**Intercepted (gated):**
+**Intercepted (gated)** — only forms where we can prove the push is the
+current branch's HEAD:
 
-- `git push`
-- `git push origin`
-- `git push origin <current-branch>`
-- `git push origin HEAD`
+- `git push origin <current-branch>`            ← explicit current branch
+- `git push origin HEAD`                        ← explicit HEAD
 - `git push -u origin <current-branch>` / `--set-upstream`
-- `git push --force` / `--force-with-lease` (no bypass — force still gates)
-- `git push --tags` (gated, since a tag push implies an associated commit chain)
+- `git push origin HEAD:<current-branch>`       ← explicit src=HEAD
+- `git push --force` / `--force-with-lease` when combined with one of the
+  above explicit forms                          ← force still gates
+- `git push` (no args) **only when** `git config push.default` resolves to
+  one of `simple` (default in modern git), `current`, or `upstream`. The
+  hook reads `push.default` once and intercepts only if the value is in
+  this allow-list. Other values (`matching`, `nothing`, etc.) → not
+  intercepted.
 
-**Not intercepted (allowed silently):**
+**Not intercepted (allowed silently)** — anywhere the gate would be guessing:
 
-- `git -C <path> push …`           ← different repo path
-- `cd <path> && git push …`        ← shell directory change before push
-- `git push <remote> <local>:<remote-ref>` where `<local>` is not HEAD or the current branch ← explicit refspec to a non-current branch
-- `git push <remote> <ref1> <ref2> …` ← multiple refspecs
-- `git push --delete origin <ref>`  ← branch deletion, not a content push
-- Any push command parsed via shell substitution Claude cannot statically analyse (e.g., `git push $(...)`)
+- `git -C <path> push …`                       ← different repo path
+- `cd <path> && git push …`                    ← shell dir change before push
+- `git push origin` (bare, without explicit ref) when `push.default` is not
+  in the allow-list above
+- `git push <remote> <ref1> <ref2> …`          ← multiple refspecs
+- `git push origin <local>:<remote>` where `<local>` is not HEAD or the
+  current branch                                ← refspec to non-current
+- `git push --tags` / `git push --follow-tags`  ← tags can point at refs
+  unrelated to HEAD
+- `git push --delete origin <ref>`              ← deletion, not a content push
+- `git push --mirror` / `--all`                 ← pushes everything
+- Any push command parsed via shell substitution Claude cannot statically
+  analyse (e.g. `git push $(detect_branch)`)
 
 Rationale: detecting these reliably requires either re-implementing git's
 argument parser in the hook or running the command in dry-run mode (which
@@ -626,7 +787,7 @@ new keys default.
 
 | Slash command | Status | Purpose |
 |---|---|---|
-| `/code-reviewer:setup` | Changed | Adds the three new keys to the wizard |
+| `/code-reviewer:setup` | Changed | Adds the four new keys to the wizard (`review_output_path`, `auto_trigger`, `skip_branches`, `keep_last_rounds`) |
 | `/code-reviewer:start [--delta\|--full] [--ticket K] [--base R] [--no-prune]` | Changed | New `--delta` / `--full` mode flags; `--no-prune` skips within-branch timestamp pruning for this run (debugging / history preservation) |
 | `/code-reviewer:autodetect true\|false` | **New** | Toggle `auto_trigger`. Empty arg → print current |
 | `/code-reviewer:dismiss add\|remove\|list ...` | **New** | Manage `DISMISSALS.md` for the current branch |
@@ -655,7 +816,7 @@ Five new files, nine changed files.
   hooks.json                                 ← NEW
 
 agents/
-  arbiter.md                                 ← UPDATED: verdict rubric, linter exclusion, OQ consolidation, dismissals
+  arbiter.md                                 ← UPDATED: verdict rubric (incl. carry-forward), linter exclusion, OQ consolidation, dismissals, emit findings.json per §3.3 schema
   claude-reviewer.md                         ← UPDATED: OQ rule, dismissals rule, linter rule, delta/full awareness
   codex-reviewer.md                          ← UPDATED: same
   gemini-reviewer.md                         ← UPDATED: same
@@ -713,7 +874,7 @@ CLAUDE.md                                    ← UPDATED
 | Rebase / force-push in Delta | Auto-fallback to Full, `fallback_reason` recorded |
 | `git push --dry-run` | Gated normally; `CR_SKIP=1` to bypass |
 | Force push | Gated normally |
-| Push refspec to other branch | Gated based on current HEAD; `CR_SKIP=1` to bypass |
+| Push refspec to other branch (`git push origin local:other`) | **Not** intercepted (§5.7). User invokes `/code-reviewer:start` manually if they want review. Documented here for clarity |
 | Non-Claude shell pushes | Not intercepted (out of scope) |
 | Branch in `skip_branches` | Plugin refuses; hook exits 0 |
 | Two worktrees, same branch | Divergent ledgers — documented as "don't do that" |
