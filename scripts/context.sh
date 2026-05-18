@@ -4,7 +4,7 @@
 # Usage:
 #   context.sh [--base <ref>] [--ticket <KEY>]
 #
-# Produces a timestamped round directory under <repo>/tmp/code-reviews/<branch>/<timestamp>/
+# Produces a timestamped round directory under <review_output_path>/<repo-slug>/<branch>/<timestamp>/
 # with diff, commits, language/linter detection, prior-review pointer, optional
 # Jira context, and a context-manifest.md.
 #
@@ -20,12 +20,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 base_override=""
 ticket_override=""
-do_cleanup=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base_override="$2"; shift 2 ;;
     --ticket) ticket_override="$2"; shift 2 ;;
-    --no-cleanup) do_cleanup=0; shift ;;
     *) echo "context.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -36,12 +34,13 @@ if [ -z "$BRANCH" ] || [ "$BRANCH" = "HEAD" ]; then
   echo "Detached HEAD — cannot review." >&2
   exit 1
 fi
-case "$BRANCH" in
-  main|master|develop)
-    echo "Refusing to run on protected branch: $BRANCH" >&2
+# skip_branches: check config for an explicit opt-out list (default empty).
+if [ -f "$CR_CONFIG_FILE" ]; then
+  if jq -e --arg b "$BRANCH" '.skip_branches[]? | select(. == $b)' "$CR_CONFIG_FILE" >/dev/null 2>&1; then
+    echo "Refusing to run: branch '$BRANCH' is in config.skip_branches" >&2
     exit 1
-    ;;
-esac
+  fi
+fi
 
 BASE=$(cr_base_branch "$base_override") || {
   echo "Could not resolve a base branch (no upstream, no origin/main, no origin/master)." >&2
@@ -56,30 +55,15 @@ fi
 
 BRANCH_SLUG=$(cr_branch_slug "$BRANCH")
 TS=$(date +%Y%m%d-%H%M%S)
-REVIEWS_ROOT="$REPO_ROOT/tmp/code-reviews"
-ROUND_DIR="$REVIEWS_ROOT/$BRANCH_SLUG/$TS"
+REVIEW_OUT=$(cr_review_output_path "$REPO_ROOT")
+REPO_SLUG=$(cr_repo_slug "$REPO_ROOT")
+BRANCH_DIR="$REVIEW_OUT/$REPO_SLUG/$BRANCH_SLUG"
+REVIEWS_ROOT="$REVIEW_OUT/$REPO_SLUG"
+ROUND_DIR="$BRANCH_DIR/$TS"
 CONTEXT_DIR="$ROUND_DIR/context"
 RESULTS_DIR="$ROUND_DIR/results"
 REPRO_DIR="$ROUND_DIR/repro"
 
-# Auto-cleanup: remove review folders for other branches so the tmp/ dir
-# doesn't accumulate stale work. Keep the current branch's history so the
-# next review can include the previous FINAL_REVIEW_RESULTS.md for the
-# regression check. Skip when --no-cleanup is passed.
-if [ "$do_cleanup" = "1" ] && [ -d "$REVIEWS_ROOT" ]; then
-  removed=()
-  for entry in "$REVIEWS_ROOT"/*; do
-    [ -d "$entry" ] || continue
-    name=$(basename "$entry")
-    if [ "$name" != "$BRANCH_SLUG" ]; then
-      rm -rf "$entry"
-      removed+=("$name")
-    fi
-  done
-  if [ ${#removed[@]} -gt 0 ]; then
-    echo "Cleanup: removed ${#removed[@]} stale branch review folder(s): ${removed[*]}" >&2
-  fi
-fi
 
 mkdir -p "$CONTEXT_DIR" "$RESULTS_DIR" "$REPRO_DIR"
 
@@ -287,7 +271,7 @@ done
 
 # ---- Previous FINAL_REVIEW_RESULTS for this branch ------------------------
 
-branch_dir="$REPO_ROOT/tmp/code-reviews/$BRANCH_SLUG"
+branch_dir="$BRANCH_DIR"
 prev_final=""
 if [ -d "$branch_dir" ]; then
   # The newest existing FINAL_REVIEW_RESULTS.md, excluding the round we just

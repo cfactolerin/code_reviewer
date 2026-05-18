@@ -14,7 +14,11 @@ mkdir -p "$CR_TEST_ROOT"
 setup_fixture_repo() {
   local name="${1:-repo}"
   local dir="$CR_TEST_ROOT/$name"
-  rm -rf "$dir"
+  local bare="$CR_TEST_ROOT/${name}.git"
+  rm -rf "$dir" "$bare"
+  # Create a bare repo as origin so cr_base_branch resolves to origin/main
+  # (not the current branch itself, which would produce an empty diff).
+  git init -q --bare "$bare" >/dev/null 2>&1
   mkdir -p "$dir"
   git -C "$dir" init -q
   git -C "$dir" config user.email "t@t.t"
@@ -24,6 +28,10 @@ setup_fixture_repo() {
   git -C "$dir" add README
   git -C "$dir" commit -qm "initial"
   git -C "$dir" branch -m main
+  git -C "$dir" remote add origin "$bare"
+  git -C "$dir" push -q origin main >/dev/null 2>&1
+  git -C "$dir" fetch -q origin >/dev/null 2>&1
+  git -C "$dir" branch --set-upstream-to=origin/main main >/dev/null 2>&1
   echo "$dir"
 }
 
