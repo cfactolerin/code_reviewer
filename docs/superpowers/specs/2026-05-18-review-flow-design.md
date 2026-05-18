@@ -277,8 +277,8 @@ final report):
     }
   ],
   "regression": {
-    "resolved": ["20260518-140000:F1"],
-    "still_present": ["20260518-140000:F4"],
+    "resolved":         ["20260518-140000:F1"],
+    "dismissed":        ["20260518-140000:F3"],
     "newly_introduced": ["F1"]
   },
   "linter_summary": {
@@ -307,8 +307,16 @@ Conventions:
 - **`carried_from`** is `null` for findings raised fresh this round;
   `"<prev_round>:<prev_id>"` when the finding was carried forward from a
   prior round during a Delta's re-verification.
-- `regression` lists round-relative IDs from the previous review entry
-  (`resolved`, `still_present`) plus this round's IDs for `newly_introduced`.
+- `regression` records the disposition of every prior finding:
+  - `resolved` — prior IDs whose code is no longer present.
+  - `dismissed` — prior IDs whose fingerprint matches a current
+    `DISMISSALS.md` entry; the code still exhibits the issue but the user
+    has marked it a false positive. These do **not** appear in the new
+    `findings` list and do **not** count toward the verdict.
+  - `newly_introduced` — this round's own IDs (so a reader can quickly see
+    what showed up since last time).
+  - "still present and not dismissed" is implicit: those are the items in
+    `findings[]` with `carried_from` set.
 - `linter_summary` and `tests` are presence/issue counts only — full output
   remains in the Markdown report.
 
@@ -387,16 +395,20 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
 
    > For each entry in `prior_findings.json`, re-verify it against the
    > current branch state. For each:
-   > - If the code at that file/line still exhibits the issue → emit a
-   >   Finding in `findings.json` with `carried_from: "<prev_round>:<prev_id>"`.
+   > - If the code at that file/line still exhibits the issue AND the
+   >   finding's fingerprint matches a `DISMISSALS.md` entry → list its
+   >   `<prev_round>:<prev_id>` in `regression.dismissed`. Do **not** include
+   >   it in `findings`. This finding will not count toward the verdict.
+   > - If the code still exhibits the issue and it is **not** dismissed →
+   >   emit a Finding in `findings.json` with `carried_from: "<prev_round>:<prev_id>"`.
    > - If the issue is no longer present → list its `<prev_round>:<prev_id>`
    >   in `regression.resolved`.
    > - If the file no longer exists → list it in `regression.resolved` with
    >   a note "(file removed)" in the human-readable report.
    >
    > Do not silently drop prior findings. Every entry in `prior_findings.json`
-   > must end up in either the new `findings` array (with `carried_from` set)
-   > or `regression.resolved`.
+   > must end up in **exactly one** of: `findings[].carried_from`,
+   > `regression.resolved`, or `regression.dismissed`.
 
    This means the new Delta's verdict is computed from **all currently-present
    findings (carried forward + new)**, not just findings the agents found in
@@ -463,10 +475,14 @@ Validation steps (run in this order):
 1. **Parseable JSON.** Run `jq empty <round_dir>/findings.json`. If exit
    non-zero → fail.
 2. **Schema required fields.** Each required key from §3.3 present with
-   correct type: top-level `round`, `verdict`, `head_sha`, `base_sha`,
-   `findings`, `open_questions`, `regression`; each finding has `id`,
-   `severity`, `category`, `file`, `summary`, `fingerprint`,
-   `reviewers_agreeing`.
+   correct type:
+   - Top-level: `round`, `verdict`, `head_sha`, `base_sha`, `findings`,
+     `open_questions`, `regression` (with sub-keys `resolved`,
+     `dismissed`, `newly_introduced`, each an array of strings).
+   - Each finding: `id`, `severity`, `category`, `file`,
+     `line` (number or `null`), `end_line` (number or `null`),
+     `summary`, `fingerprint`, `reviewers_agreeing`,
+     `carried_from` (string or `null`).
 3. **Enum constraints.** `verdict ∈ {APPROVE, APPROVE_WITH_COMMENTS,
    REQUEST_CHANGES, BLOCK}`. `severity ∈ {CRITICAL, HIGH, MEDIUM, LOW}` for
    every finding. `confidence ∈ {HIGH, MEDIUM, LOW}` if present.
@@ -474,12 +490,16 @@ Validation steps (run in this order):
    The recorded `verdict` must equal the verdict that the listed findings
    would produce. Mismatch → fail.
 5. **Carry-forward accounting (Delta only).** Every entry in
-   `prior_findings.json` (from the prior round) must appear either:
-   - in this round's `findings` array with `carried_from` set to
+   `prior_findings.json` (from the prior round) must appear in **exactly
+   one** of:
+   - this round's `findings` array with `carried_from` set to
      `"<prev_round>:<prev_id>"`, or
-   - in `regression.resolved` as `"<prev_round>:<prev_id>"`.
-   No prior finding may be silently dropped. Likewise, every
-   `carried_from` reference must point to a real ID in `prior_findings.json`.
+   - `regression.resolved` as `"<prev_round>:<prev_id>"`, or
+   - `regression.dismissed` as `"<prev_round>:<prev_id>"`.
+   No prior finding may be silently dropped or double-counted. Likewise,
+   every `carried_from` reference must point to a real ID in
+   `prior_findings.json`, and every ID in `regression.dismissed` must have
+   a matching fingerprint in the current `DISMISSALS.md`.
 6. **Fingerprint plausibility.** Each `fingerprint` matches the pattern
    `<file>:<line>:<slug>` and is internally unique within the file.
 
@@ -559,19 +579,26 @@ def base_compatible(r):
     return True
   return git merge-base --is-ancestor r.base_sha current_base_sha
 
-# 3. Find entries matching FULL state + base compatibility
+# 3. Find entries matching FULL state + base compatibility + commit-only
+#    `git push` only ships commits — never uncommitted work. So an approval
+#    only authorises a push if the approval was of a CLEAN tree
+#    (worktree_hash == null) AND the current tree is clean.
+if current_worktree_hash != null:
+  deny("commit_needed")  # uncommitted changes locally; commit before push
+
 matching = [r for r in ledger.reviews
             if r.head_sha == current_head_sha
-            and r.worktree_hash == current_worktree_hash
+            and r.worktree_hash == null              # clean approvals only
             and base_compatible(r)]
 
 if not matching:
   # Categorise the failure for a useful deny reason
-  same_head = [r for r in ledger.reviews if r.head_sha == current_head_sha]
-  if not same_head:
+  same_head_any = [r for r in ledger.reviews if r.head_sha == current_head_sha]
+  same_head_clean = [r for r in same_head_any if r.worktree_hash == null]
+  if not same_head_any:
     deny("head_changed")
-  elif not any(r.worktree_hash == current_worktree_hash for r in same_head):
-    deny("worktree_changed")
+  elif not same_head_clean:
+    deny("commit_needed")   # HEAD was only reviewed with a dirty worktree
   else:
     deny("base_drifted")
 
@@ -589,9 +616,23 @@ Notes on the base check:
   post-filter. This matters when the same `(head_sha, worktree_hash)` was
   reviewed against different bases: an older compatible approval is not
   ignored just because a newer incompatible review was logged.
-- The hook resolves the current base ref the same way `context.sh` does
-  (`--base` override → `cr_base_branch` config → `@{u}` → `origin/main` →
-  `origin/master`).
+- **The hook and `context.sh` use different base-resolution chains** on
+  purpose:
+  - `context.sh` (review-time): `--base <ref>` flag → `config.base_branch`
+    → `@{u}` → `origin/main` → `origin/master`. The user can target an
+    arbitrary base for a review.
+  - **Hook (push-time):** `@{u}` (what `git push` actually targets) →
+    `origin/main` → `origin/master`. The hook never honours the historical
+    `--base` flag because it has no access to the slash command's arguments
+    — it can only see the current git state. This is intentional: the gate
+    must compare against what the push will move, not what the review
+    happened to target.
+- Consequence: an ad-hoc `/code-reviewer:start --base origin/develop` whose
+  result is then used to push to `origin/main` may produce a `base_drifted`
+  deny if `origin/develop` is not an ancestor of `origin/main`. The
+  operator fix is to either (a) set `config.base_branch` so the review
+  consistently uses the same base the push will use, or (b) re-run the
+  review without `--base` so it picks up the upstream automatically.
 - A review entry is **base-compatible** with the current state when its
   `base_sha` equals `current_base_sha` OR is an ancestor of it (i.e., the
   review covered at least what the push will move).
@@ -614,9 +655,14 @@ Deny reason keys:
 |---|---|
 | Ledger missing | `no_ledger` |
 | HEAD never reviewed at any state | `head_changed` |
-| HEAD reviewed at different worktree state(s) | `worktree_changed` |
+| Uncommitted changes locally, OR HEAD was only reviewed with a dirty worktree | `commit_needed` |
 | Base has commits not covered by the review | `base_drifted` |
 | Latest matching entry's verdict is BLOCK or REQUEST_CHANGES | `not_approved` |
+
+> **Why no `worktree_changed`?** A dirty-tree review never authorises a push,
+> so the only worktree-related deny is `commit_needed`. If the user wants
+> their dirty-state review to gate the push, they must commit the changes
+> and re-review (which will short-circuit if content is unchanged).
 
 ### 5.4 Hook output
 
@@ -704,10 +750,10 @@ has its own side effects). Both are over-engineering. If the user wants the
 gate to fire on a non-simple push, they re-arrange the command, or accept
 that the gate is bypassed and `/code-reviewer:start` can be run explicitly.
 
-When the hook intercepts but matches the "not intercepted" patterns, it
-emits a single-line stderr notice (`code-reviewer: not gating non-simple push
-form`) so the user knows the gate didn't run for this push. The push still
-proceeds.
+Not-intercepted forms exit 0 with **no output**. The user is presumed to
+know they're doing something the hook doesn't gate; adding stderr noise on
+every such push would be more annoying than useful. If the user wants a
+review for one of those forms, they run `/code-reviewer:start` explicitly.
 
 ## 6. Phase 7 hand-off & Open Questions
 
@@ -779,6 +825,15 @@ Achieved? <Yes|Partially|No> — <one paragraph>
 When the verdict is not `[APPROVE]`, append:
 
 > *To push anyway without addressing findings: ask me to push and I'll run `CR_SKIP=1 git push` for that single push.*
+
+When the working tree was dirty during this review, the rich-text output
+also includes:
+
+> *This review covered uncommitted changes (`worktree_hash != null`). It
+> does NOT authorise `git push` — pushes only ship commits. Commit the
+> changes and re-run `/code-reviewer:start --delta` (which should
+> short-circuit if the content is the same) so the next review entry has
+> a clean worktree and can gate the push.*
 
 When the report has findings, append:
 
@@ -863,7 +918,7 @@ Full `~/.code-reviewer/config.json` schema:
   "review_output_path": "/tmp/code-reviewer",
   "auto_trigger": true,
   "skip_branches": [],
-  "keep_last_rounds": 10,             // must be >= 1; pruning will not delete the most recent round
+  "keep_last_rounds": 10,
 
 
   "jira_base_url": "",
@@ -874,6 +929,17 @@ Full `~/.code-reviewer/config.json` schema:
 
 New keys are additive — existing v0.3.0 configs continue to work; missing
 new keys default.
+
+**Constraints:**
+
+- `keep_last_rounds`: integer, must be `>= 1`. The setup wizard and
+  `context.sh` reject smaller values. Pruning will never delete the most
+  recent round directory even when `keep_last_rounds == 1`.
+- `review_output_path`: string. `~` is expanded; relative paths resolve
+  against `$REPO_ROOT`.
+- `auto_trigger`: boolean. When `false`, the hook exits 0 silently.
+- `skip_branches`: array of strings. Exact-match against `git rev-parse
+  --abbrev-ref HEAD`.
 
 ## 10. New commands
 
