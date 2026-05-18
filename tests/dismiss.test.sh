@@ -42,6 +42,37 @@ bash "$SCRIPTS/dismiss.sh" remove "$DISM" "no/such:99"
 out=$(bash "$SCRIPTS/dismiss.sh" list "$DISM")
 assert_contains "$out" "src/db.rs:120:n_plus_1"
 
+# --- C1 regression: removing src/auth.rs:42 must not also remove src/authXrs:42 ---
+# Set up two near-look-alike entries.
+bash "$SCRIPTS/dismiss.sh" add "$DISM" "src/auth.rs:42" "alpha" "x"
+bash "$SCRIPTS/dismiss.sh" add "$DISM" "src/authXrs:42" "alpha2" "y"
+bash "$SCRIPTS/dismiss.sh" remove "$DISM" "src/auth.rs:42"
+out=$(bash "$SCRIPTS/dismiss.sh" list "$DISM")
+case "$out" in *"src/auth.rs:42:alpha"*) echo "FAIL: src/auth.rs:42 entry should be removed"; exit 1 ;; esac
+assert_contains "$out" "src/authXrs:42:alpha2" "src/authXrs:42 (look-alike) must be retained"
+
+# --- I1 regression: range heading remove-by-start-line works (matches by fingerprint) ---
+# Manually craft a range-heading entry (no helper supports range adds yet — the section
+# format is what the arbiter/user might write).
+{
+  echo ""
+  echo "## src/db.rs:118-130 — Unsynchronised access"
+  echo ""
+  echo "**Fingerprint:** \`src/db.rs:118:unsynchronised_access\`"
+  echo ""
+  echo "Dismissed: 2026-05-18"
+  echo "Reason: cache only mutated at startup"
+} >> "$DISM"
+bash "$SCRIPTS/dismiss.sh" remove "$DISM" "src/db.rs:118"
+out=$(bash "$SCRIPTS/dismiss.sh" list "$DISM")
+case "$out" in *"src/db.rs:118:unsynchronised_access"*) echo "FAIL: range-heading entry should be removed"; exit 1 ;; esac
+
+# --- I2 regression: list emits <fp> — <date> — <summary> ---
+# Use the existing src/db.rs:120 entry from earlier in the test.
+out=$(bash "$SCRIPTS/dismiss.sh" list "$DISM")
+assert_contains "$out" "src/db.rs:120:n_plus_1 — " "list should include date separator"
+assert_contains "$out" " — N+1" "list should include the original summary"
+
 # --- slug rules: spaces, capitals, punctuation normalised ---
 bash "$SCRIPTS/dismiss.sh" add "$DISM" "foo.py:10" "Mixed CASE & punct!" "x"
 out=$(bash "$SCRIPTS/dismiss.sh" list "$DISM")

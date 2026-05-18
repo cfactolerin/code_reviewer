@@ -49,35 +49,39 @@ case "$cmd" in
     ;;
 
   remove)
-    floc="${1:-}"; summary_sub="${2:-}"
+    floc="${1:-}"; sumfilter="${2:-}"
     [ -n "$file" ] && [ -n "$floc" ] || { echo "Usage: dismiss.sh remove <file> <file:line> [<summary-substring>]" >&2; exit 2; }
     [ -f "$file" ] || { echo "code-reviewer: no DISMISSALS.md found" >&2; exit 0; }
-    awk -v fl="$floc" -v sumfilter="$summary_sub" '
-      BEGIN { keep=1; buf=""; have_fp=0; matches=0 }
-      /^## / {
-        # Flush previous section.
+    awk -v fl="$floc" -v sumfilter="$sumfilter" '
+      function flush() {
         if (buf != "") {
           if (keep) printf "%s", buf
-          buf=""; have_fp=0; matches=0
-        }
-        keep=1
-        # Examine heading: does it start with "## <file:line> —"?
-        if ($0 ~ "^## "fl" — ") {
-          matches=1
+          buf=""; in_section=0; fp=""; section_matches=0
         }
       }
-      matches && /^\*\*Fingerprint:\*\*/ {
-        # Honour summary substring filter if provided
-        if (sumfilter != "" && index($0, sumfilter) == 0) {
-          # different summary, leave section in place
-        } else {
-          keep=0
+      /^## / {
+        flush()
+        in_section=1
+        keep=1
+        section_matches=0
+        fp=""
+      }
+      in_section && /^\*\*Fingerprint:\*\*[ \t]+`[^`]+`/ {
+        match($0, /`[^`]+`/)
+        fp = substr($0, RSTART+1, RLENGTH-2)
+        # fl is a prefix iff fp starts with "<fl>:"
+        n = length(fl)
+        if (substr(fp, 1, n+1) == fl ":") {
+          # If a summary-substring filter is provided, the slug portion must contain it.
+          slug_part = substr(fp, n+2)
+          if (sumfilter == "" || index(slug_part, sumfilter) > 0) {
+            section_matches=1
+          }
         }
+        if (section_matches) keep=0
       }
       { buf = buf $0 "\n" }
-      END {
-        if (buf != "" && keep) printf "%s", buf
-      }
+      END { flush() }
     ' "$file" > "${file}.new.$$"
     mv "${file}.new.$$" "$file"
     ;;
@@ -85,12 +89,29 @@ case "$cmd" in
   list)
     [ -n "$file" ] || { echo "Usage: dismiss.sh list <file>" >&2; exit 2; }
     [ -f "$file" ] || exit 0
-    awk '
-      /^\*\*Fingerprint:\*\*[ \t]+`([^`]+)`/ {
+    awk -v sep=" — " '
+      function flush() {
+        if (fp != "" && in_section) {
+          printf "%s — %s — %s\n", fp, (date == "" ? "?" : date), (summary == "" ? "?" : summary)
+        }
+        fp=""; date=""; summary=""; in_section=0
+      }
+      /^## / {
+        flush()
+        in_section=1
+        # Extract summary: everything after the first " — " separator.
+        i = index($0, sep)
+        if (i > 0) summary = substr($0, i+length(sep))
+      }
+      in_section && /^\*\*Fingerprint:\*\*[ \t]+`[^`]+`/ {
         match($0, /`[^`]+`/)
         fp = substr($0, RSTART+1, RLENGTH-2)
-        print fp
       }
+      in_section && /^Dismissed:[ \t]+/ {
+        sub(/^Dismissed:[ \t]+/, "")
+        date = $0
+      }
+      END { flush() }
     ' "$file"
     ;;
 
