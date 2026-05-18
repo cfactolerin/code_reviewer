@@ -147,6 +147,7 @@ Append-only timeline of reviews for the branch.
       "commits_reviewed": ["abc123..."],
       "previous_head_sha": null,
       "worktree_hash": null,
+      "dismissals_hash": null,
       "verdict": "APPROVE",
       "findings": { "critical": 0, "high": 0, "medium": 0, "low": 0 },
       "open_questions": 0,
@@ -162,6 +163,7 @@ Append-only timeline of reviews for the branch.
       "commits_reviewed": ["def456..."],
       "previous_head_sha": "abc123...",
       "worktree_hash": "sha256:7f3e...",
+      "dismissals_hash": "sha256:a91b...",
       "verdict": "REQUEST_CHANGES",
       "findings": { "critical": 0, "high": 2, "medium": 1, "low": 0 },
       "open_questions": 1,
@@ -207,6 +209,9 @@ Invariants:
   `hW`) and was unsafe for unstaged edits.
 - `previous_head_sha` (Delta) = `head_sha` of the prior review the Delta
   built on.
+- `dismissals_hash` = `sha256(<DISMISSALS.md contents>)` at review start, or
+  `null` if the file does not exist. Used by Delta's nothing-new
+  short-circuit and by future debugging.
 - `fallback_reason` is set when Delta auto-falls-back to Full (e.g.,
   `"rebase_detected"`).
 - `findings` counts come from the arbiter's final report; counts of *Findings*
@@ -350,15 +355,31 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
 ### 4.2 Delta mode
 
 1. Read ledger; locate most recent entry `prev`.
-2. Verify `prev.head_sha` is an ancestor of HEAD. If not → fallback to Full
-   (`fallback_reason: "rebase_detected"`).
+2. **Prerequisite checks** (any failure → fallback to Full):
+   - `git merge-base --is-ancestor prev.head_sha HEAD` (rebase detection;
+     `fallback_reason: "rebase_detected"`)
+   - Resolve `current_base_sha = git rev-parse <current.base_ref>`. Require
+     `prev.base_sha == current_base_sha`; if not, the base shifted between
+     reviews and the Delta's scope would diverge from what the prior review
+     covered. Fall back to Full (`fallback_reason: "base_changed"`).
+   - Verify `<prev.round_dir>/findings.json` exists and is readable. If
+     missing (manual deletion or aggressive pruning below `keep_last_rounds`),
+     fall back to Full (`fallback_reason: "prior_findings_missing"`).
 3. Compute "new material":
    - new commits = `git log prev.head_sha..HEAD --reverse`
    - current `worktree_hash` per the manifest algorithm in §3.2.
-4. **Nothing-new short-circuit:** if there are zero new commits AND
-   `worktree_hash == prev.worktree_hash`, exit early with
+   - current `dismissals_hash` = `sha256(<DISMISSALS.md>)` (or `null` if
+     file missing).
+4. **Nothing-new short-circuit:** if **all three** of the following are
+   unchanged, exit early with
    `"Nothing new to review since <ts>; last verdict was <verdict>."` No new
-   round directory, no ledger entry, no agent dispatch.
+   round directory, no ledger entry, no agent dispatch:
+   - zero new commits
+   - `worktree_hash == prev.worktree_hash`
+   - `dismissals_hash == prev.dismissals_hash`
+
+   In particular, **any change to `DISMISSALS.md` forces a real review** so
+   the dismissal can affect the verdict and the gate.
 5. **Carry-forward unresolved findings** (the verdict-correctness gate).
    Read the previous round's `findings.json` (per §3.3). The arbiter is
    passed `prior_findings.json` (a copy of `prev.findings.json`'s
@@ -385,7 +406,7 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
    Only download missing tickets.
 7. Build the review prompt around the new material, but include the prior
    `FINAL_REVIEW_RESULTS.md` verbatim as regression context AND the
-   `prior_unresolved.json` for explicit re-verification.
+   `prior_findings.json` for explicit re-verification.
 8. Include `DISMISSALS.md` (if present) and the previous review's Open
    Questions section (as "open" status — reviewers may flag the same OQ
    again if still unresolved, or note resolution if they detect it in the
@@ -400,8 +421,20 @@ rewritten — Delta is unsafe. Auto-fall back to Full, record
 1. **Refresh Jira cache safely:**
    - Download every detected Jira key, its attachments, and all linked
      Confluence pages into `.jira-cache.new/`.
-   - On success: `mv .jira-cache .jira-cache.old && mv .jira-cache.new .jira-cache && rm -rf .jira-cache.old`. Update `jira_cached_at` in the ledger.
-   - On any failure (HTTP error, timeout, partial content): `rm -rf .jira-cache.new`, keep the existing `.jira-cache/` in place, and log a warning into the round dir's `context/jira.warn` file: "Jira refresh failed at <ts>; using stale cache from <prev_cached_at>." Do not abort the review.
+   - On success: atomic swap that handles the no-existing-cache case:
+     ```
+     rm -rf .jira-cache.old        # clear any leftover from a prior swap
+     [ -d .jira-cache ] && mv .jira-cache .jira-cache.old
+     mv .jira-cache.new .jira-cache
+     rm -rf .jira-cache.old
+     ```
+     Update `jira_cached_at` in the ledger.
+   - On any failure (HTTP error, timeout, partial content):
+     `rm -rf .jira-cache.new`, keep the existing `.jira-cache/` (if any)
+     in place, and log a warning into the round dir's `context/jira.warn`
+     file: "Jira refresh failed at <ts>; using stale cache from
+     <prev_cached_at> (or no cache if first run)." Do not abort the
+     review.
 2. Compute the full diff: `git diff <merge-base>...HEAD` + working-tree state.
 3. Build the review prompt around the entire branch diff. Any prior
    `FINAL_REVIEW_RESULTS.md` from this branch goes in as secondary context
@@ -418,6 +451,56 @@ If the branch name or commits reference more than one Jira key (e.g.
 single `## Jira Context` section with each ticket headed by its key.
 Reviewers treat all tickets as equally authoritative. No "primary ticket"
 concept.
+
+### 4.5 `findings.json` validation gate
+
+Before appending a ledger entry, the orchestrator script validates the
+arbiter's output. **Validation failure → no ledger append** (so the hook
+will keep denying, which is the safe direction).
+
+Validation steps (run in this order):
+
+1. **Parseable JSON.** Run `jq empty <round_dir>/findings.json`. If exit
+   non-zero → fail.
+2. **Schema required fields.** Each required key from §3.3 present with
+   correct type: top-level `round`, `verdict`, `head_sha`, `base_sha`,
+   `findings`, `open_questions`, `regression`; each finding has `id`,
+   `severity`, `category`, `file`, `summary`, `fingerprint`,
+   `reviewers_agreeing`.
+3. **Enum constraints.** `verdict ∈ {APPROVE, APPROVE_WITH_COMMENTS,
+   REQUEST_CHANGES, BLOCK}`. `severity ∈ {CRITICAL, HIGH, MEDIUM, LOW}` for
+   every finding. `confidence ∈ {HIGH, MEDIUM, LOW}` if present.
+4. **Verdict / severity consistency.** Apply the §7 rubric mechanically.
+   The recorded `verdict` must equal the verdict that the listed findings
+   would produce. Mismatch → fail.
+5. **Carry-forward accounting (Delta only).** Every entry in
+   `prior_findings.json` (from the prior round) must appear either:
+   - in this round's `findings` array with `carried_from` set to
+     `"<prev_round>:<prev_id>"`, or
+   - in `regression.resolved` as `"<prev_round>:<prev_id>"`.
+   No prior finding may be silently dropped. Likewise, every
+   `carried_from` reference must point to a real ID in `prior_findings.json`.
+6. **Fingerprint plausibility.** Each `fingerprint` matches the pattern
+   `<file>:<line>:<slug>` and is internally unique within the file.
+
+On failure:
+
+1. Move the arbiter's output to
+   `<round_dir>/findings.json.invalid` and write
+   `<round_dir>/validation-errors.md` listing each failed check with the
+   offending JSON path.
+2. **Retry the arbiter once**, passing the validation errors in the
+   correction prompt. If the retry passes validation → proceed normally.
+3. If the retry also fails → write `<round_dir>/REVIEW_FAILED.md`
+   explaining the situation and stop. **No ledger entry is appended.** The
+   hook will continue denying any push that depends on this branch's
+   review state, which is the correct safe behaviour. The user can re-run
+   `/code-reviewer:start --full` or address the validation issue and
+   re-run.
+
+This sits between Phase 6 (arbiter completes) and the existing Phase 7
+(hand-off). The hand-off rich text on a failed validation surfaces the
+failure prominently rather than the would-be report.
 
 ## 5. PreToolUse hook
 
@@ -465,27 +548,35 @@ if (no commits ahead of @{u} or origin/<branch>) AND worktree_hash == null:
 if not ledger.exists:
   deny("no_ledger")
 
-# 2. Find entries matching the FULL state tuple, not just HEAD
+# 2. Compute the current base SHA before filtering, so base compatibility
+#    can be part of the matching predicate (not a post-filter).
+current_base_sha = git rev-parse <current.base_ref>  # may be empty for new repos
+
+def base_compatible(r):
+  if not current_base_sha:    # no upstream → skip base check
+    return True
+  if r.base_sha == current_base_sha:
+    return True
+  return git merge-base --is-ancestor r.base_sha current_base_sha
+
+# 3. Find entries matching FULL state + base compatibility
 matching = [r for r in ledger.reviews
             if r.head_sha == current_head_sha
-            and r.worktree_hash == current_worktree_hash]
+            and r.worktree_hash == current_worktree_hash
+            and base_compatible(r)]
 
 if not matching:
-  if any(r.head_sha == current_head_sha for r in ledger.reviews):
-    deny("worktree_changed")   # HEAD was reviewed at a different worktree state
+  # Categorise the failure for a useful deny reason
+  same_head = [r for r in ledger.reviews if r.head_sha == current_head_sha]
+  if not same_head:
+    deny("head_changed")
+  elif not any(r.worktree_hash == current_worktree_hash for r in same_head):
+    deny("worktree_changed")
   else:
-    deny("head_changed")        # HEAD itself has never been reviewed
+    deny("base_drifted")
 
-# 3. Base coverage — the review's base must cover what the push will diff
-#    against. Otherwise commits in the current upstream that weren't in the
-#    review's base are unreviewed material.
-current_base_sha = git rev-parse <current.cr_base_branch>
+# 4. Latest matching entry decides
 latest = matching[-1]
-if latest.base_sha != current_base_sha:
-  if not git merge-base --is-ancestor latest.base_sha current_base_sha:
-    deny("base_drifted")  # current base has commits not covered by the review
-
-# 4. Verdict decides
 if latest.verdict in {APPROVE, APPROVE_WITH_COMMENTS}:
   exit 0
 else:
@@ -494,18 +585,18 @@ else:
 
 Notes on the base check:
 
+- Base compatibility is part of the **matching predicate**, not a
+  post-filter. This matters when the same `(head_sha, worktree_hash)` was
+  reviewed against different bases: an older compatible approval is not
+  ignored just because a newer incompatible review was logged.
 - The hook resolves the current base ref the same way `context.sh` does
   (`--base` override → `cr_base_branch` config → `@{u}` → `origin/main` →
   `origin/master`).
-- If `latest.base_sha == current_base_sha`, the base is identical — skip
-  the ancestor check.
-- If `latest.base_sha` is an ancestor of `current_base_sha`, the review
-  covered a superset of what the push will move — safe to allow.
-- If `latest.base_sha` is unrelated to or a descendant of
-  `current_base_sha`, the review covered too little — deny.
+- A review entry is **base-compatible** with the current state when its
+  `base_sha` equals `current_base_sha` OR is an ancestor of it (i.e., the
+  review covered at least what the push will move).
 - If the upstream / base ref has never existed locally (brand-new repo),
-  the base check is skipped (no current_base_sha to compare against) and
-  step 4 proceeds.
+  the base predicate returns true (no current_base_sha to compare against).
 
 Two important properties of this gate:
 
@@ -772,7 +863,8 @@ Full `~/.code-reviewer/config.json` schema:
   "review_output_path": "/tmp/code-reviewer",
   "auto_trigger": true,
   "skip_branches": [],
-  "keep_last_rounds": 10,
+  "keep_last_rounds": 10,             // must be >= 1; pruning will not delete the most recent round
+
 
   "jira_base_url": "",
   "jira_email": "",
@@ -807,7 +899,7 @@ idempotent (no match → no-op message).
 
 ## 11. File inventory
 
-Five new files, nine changed files.
+Six new files (counted below), plus changes to existing files.
 
 ```
 .claude-plugin/
