@@ -1,15 +1,21 @@
 ---
 name: code-reviewer-start
-description: Non-interactive multi-agent review of the current branch vs its base. Runs Claude/Codex/Gemini/opencode in parallel, arbiter synthesises results, writes FINAL_REVIEW_RESULTS.md the implementing agent can act on. Optional flags - --ticket <KEY> --base <ref>.
+description: Non-interactive multi-agent review of the current branch vs its base. Runs Claude/Codex/Gemini/opencode in parallel, arbiter synthesises results, writes FINAL_REVIEW_RESULTS.md the implementing agent can act on, and hands off to the main session with a fix/skip prompt. Optional flags - --ticket <KEY> --base <ref>.
 argument-hint: "[--ticket <KEY>] [--base <ref>]"
-allowed-tools: ["Bash(*)", Read, Write, Grep, Glob, Agent, TaskCreate, TaskUpdate, TaskList]
+allowed-tools: ["Bash(*)", Read, Write, Grep, Glob, Agent, TaskCreate, TaskUpdate, TaskList, AskUserQuestion]
 ---
 
 # code-reviewer Start — Non-Interactive Multi-Agent Review
 
 You are orchestrating a strict pre-push code review on the **current local
-branch**. This skill is **non-interactive**: do not ask the user questions.
-Drive the pipeline to completion and produce `FINAL_REVIEW_RESULTS.md`.
+branch**. The multi-agent review itself is **non-interactive** — do not ask
+the user questions during context gathering, agent dispatch, or arbiter
+synthesis. Drive the pipeline to completion and produce
+`FINAL_REVIEW_RESULTS.md`.
+
+The **final hand-off** (Phase 7) is the only place you talk to the user: you
+show the Summary and ask whether to fix the findings now, fix a subset, or
+leave the report for later.
 
 Throughout this skill:
 
@@ -44,6 +50,7 @@ and `completed` when done:
 4. "Run agent reviews in parallel"
 5. "Arbiter synthesis"
 6. "Write FINAL_REVIEW_RESULTS.md"
+7. "Hand off to user"
 
 ## Phase 1: Gather Context
 
@@ -352,24 +359,86 @@ Copy the final report to the round root as `FINAL_REVIEW_RESULTS.md`:
 cp <ROUND_DIR>/results/final-report.md <ROUND_DIR>/FINAL_REVIEW_RESULTS.md
 ```
 
-Then output a short text summary to the user (this is the only user-facing
-output — keep it tight, no question, no menu):
+**Update task 6 → completed.**
+
+## Phase 7: Hand Off to the User
+
+**Update task 7 → in_progress.**
+
+This is the **only** phase where you talk to the user.
+
+### 7a. Print the report summary
+
+Read `<ROUND_DIR>/FINAL_REVIEW_RESULTS.md` and print to the user (as regular
+text output, not a tool call) the verdict line plus the `## Summary` section
+including its `### Top Risks` subsection. Append a line with the file path so
+the user can open the full report:
 
 ```
 # Code review complete
 
-Final report: <ROUND_DIR>/FINAL_REVIEW_RESULTS.md
+**Report:** <ROUND_DIR>/FINAL_REVIEW_RESULTS.md
 
-<one-line verdict line copied from the report — e.g.
-"Verdict: [REQUEST_CHANGES] · Confidence: HIGH · Findings: 2 critical, 5 high, 3 medium">
+<copy the verdict / confidence / counts line from the report>
 
-The implementing agent can read FINAL_REVIEW_RESULTS.md to fix issues before
-pushing the branch. Run `/code-reviewer:start` again after fixes for a
-regression check — the previous report is automatically included in the next
-review's context.
+## Summary
+<verbatim copy of the Summary section, including Top Risks>
 ```
 
-**Update task 6 → completed.**
+Then list the findings in `## Detailed Findings`, one per line, with their
+finding number, severity, file:line, and one-line title — so the user can
+reference them by number in their reply. Example:
+
+```
+## Findings
+- F1 (CRITICAL) src/auth.rs:42 — missing null check on session token
+- F2 (HIGH) src/db.rs:120 — N+1 query in `load_users`
+- F3 (MEDIUM) src/api.rs:88 — missing test for new branch in `validate_input`
+```
+
+### 7b. Ask the user how to proceed
+
+Use AskUserQuestion. The question text:
+
+```
+The code review found N findings (X critical, Y high, Z medium, W low). How would you like to proceed?
+```
+
+Options (single-select):
+
+- **Fix everything** — Recommended if there are CRITICAL or HIGH findings. The
+  main session will read FINAL_REVIEW_RESULTS.md and start applying fixes
+  finding-by-finding, running the acceptance check for each, then re-run
+  `/code-reviewer:start` for a regression check.
+- **Fix a subset** — User will name the finding numbers to fix (e.g. "F1, F3, F5").
+  Skip everything else.
+- **Discuss first** — Don't fix yet. The user wants to read the report and
+  ask questions about specific findings before deciding.
+- **Skip for now** — Leave the report on disk. Do nothing. User will push or
+  re-review later.
+
+### 7c. Handle the response
+
+- **Fix everything**: read FINAL_REVIEW_RESULTS.md (full file), confirm to the
+  user: "Fixing all N findings. I'll apply changes finding-by-finding,
+  running the acceptance check after each. After all fixes, I'll re-run
+  `/code-reviewer:start` for a regression check before you push."
+  Then begin fixing. Do not push the branch.
+
+- **Fix a subset**: ask "Which finding numbers? e.g. F1, F3, F5". After they
+  reply, read FINAL_REVIEW_RESULTS.md and fix only the named findings. Same
+  acceptance-check + regression-rerun discipline.
+
+- **Discuss first**: tell the user "Report is at <path>. Ask me about any
+  finding by number (e.g. 'tell me more about F2') or by area (e.g.
+  'walk me through the security findings')." Then enter Q&A mode using
+  AskUserQuestion if needed.
+
+- **Skip for now**: print "Report saved at <path>. Re-run `/code-reviewer:start`
+  after fixes for a regression check — the previous report is automatically
+  included in the next review's context." Then stop.
+
+**Update task 7 → completed.**
 
 ---
 
@@ -384,8 +453,9 @@ review's context.
 
 ## Key Reminders
 
-- This skill is **non-interactive**. No `AskUserQuestion`. No menus. Drive the
-  pipeline to a written artifact.
+- The **review pipeline** (Phases 1–6) is non-interactive. No `AskUserQuestion`
+  in those phases. Drive the pipeline to a written artifact.
+- The **hand-off** (Phase 7) is the only place you call `AskUserQuestion`.
 - All file paths must be absolute.
 - Agent dispatches for review and Q&A use the Agent tool. Dispatch in
   parallel where possible (single message, multiple tool calls).

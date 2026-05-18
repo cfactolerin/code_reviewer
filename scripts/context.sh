@@ -60,6 +60,18 @@ RESULTS_DIR="$ROUND_DIR/results"
 REPRO_DIR="$ROUND_DIR/repro"
 mkdir -p "$CONTEXT_DIR" "$RESULTS_DIR" "$REPRO_DIR"
 
+# Make sure the consumer repo ignores plugin output. Idempotent.
+gitignore_path="$REPO_ROOT/.gitignore"
+gitignore_marker="# Added by code-reviewer plugin"
+if ! grep -qE '^(/?tmp/?$|/?tmp/code-reviews/?$|/?tmp/\*\*$)' "$gitignore_path" 2>/dev/null; then
+  {
+    [ -s "$gitignore_path" ] && [ -n "$(tail -c1 "$gitignore_path" 2>/dev/null)" ] && echo ""
+    echo "$gitignore_marker"
+    echo "tmp/code-reviews/"
+  } >> "$gitignore_path"
+  echo "Added tmp/code-reviews/ to $gitignore_path" >&2
+fi
+
 echo "Repo:    $REPO_ROOT" >&2
 echo "Branch:  $BRANCH" >&2
 echo "Base:    $BASE" >&2

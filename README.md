@@ -78,10 +78,23 @@ and a final report is written to:
 <repo>/tmp/code-reviews/<branch>/<YYYYMMDD-HHMMSS>/FINAL_REVIEW_RESULTS.md
 ```
 
-The implementing agent (and you) can read that file directly and apply the
-fixes. Run `/code-reviewer:start` again after fixes for a regression check —
-the previous report is automatically included in the next review's context so
-the arbiter can call out new regressions vs items fixed.
+After the review finishes, the skill hands back to the main Claude Code
+session with a prompt:
+
+> The code review found N findings (X critical, Y high, …). How would you
+> like to proceed?
+>
+> - **Fix everything** — apply fixes finding-by-finding, re-run for regression check
+> - **Fix a subset** — name the finding numbers to fix
+> - **Discuss first** — Q&A about findings before deciding
+> - **Skip for now** — leave the report and continue
+
+Pick **Fix everything** for the typical case: the main session reads
+`FINAL_REVIEW_RESULTS.md`, applies fixes one by one (running each finding's
+acceptance check), then re-runs `/code-reviewer:start`. The previous report
+is automatically included in the next review's context, so the arbiter
+explicitly calls out regressions, items now fixed, and any newly introduced
+issues.
 
 ## Skills
 
@@ -148,8 +161,9 @@ the arbiter can call out new regressions vs items fixed.
 └── repro/                        # repro tests reviewers wrote to prove bugs
 ```
 
-**Add `tmp/` (or `tmp/code-reviews/`) to your project's `.gitignore`** — the
-plugin writes inside the repo and you don't want reviews committed.
+The plugin auto-adds `tmp/code-reviews/` to your project's `.gitignore` on
+first run (idempotent — won't duplicate if it's already covered by `tmp/` or
+`tmp/code-reviews/`). You don't need to do this by hand.
 
 ## Configuration
 

@@ -1,7 +1,7 @@
 {
   "name": "code-reviewer",
   "description": "Non-interactive multi-agent local-branch review run before pushing. Agents review the branch diff against base, arbiter synthesises a strict FINAL_REVIEW_RESULTS.md the implementing agent can act on.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Cris Factolerin"
   }

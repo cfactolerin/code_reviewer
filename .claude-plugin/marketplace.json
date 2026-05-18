@@ -7,7 +7,7 @@
     {
       "name": "code-reviewer",
       "description": "Non-interactive multi-agent local-branch review run before pushing. Strict review with linters, tests, regression detection, security and efficiency checks. Output is a FINAL_REVIEW_RESULTS.md for the implementing agent to act on.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "source": "./"
     }
   ]

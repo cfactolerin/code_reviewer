@@ -157,15 +157,71 @@ agents run them as part of their review.
 
 ## Versioning
 
-- `.claude-plugin/plugin.json` `version`
-- `.claude-plugin/marketplace.json` `version` (under `plugins[0]`)
+**Every commit bumps the version and keeps both manifest files in lockstep.**
+No exceptions — even docs-only or skill-only changes. There is no compiled
+binary so there is no rebuild step (this is the one difference from `prr`'s
+versioning workflow).
 
-Bump both in lockstep on every change. There's no compiled binary to rebuild.
+### Version files (both must match, exactly)
 
-Suggested semver-ish bumps (current `0.x.y`):
+1. `.claude-plugin/plugin.json` — `version` field
+2. `.claude-plugin/marketplace.json` — `version` field under `plugins[0]`
 
-- **Skill / script logic changes**: bump minor
-- **Docs only**: bump patch
+If they drift, the marketplace install will be inconsistent. Use the helper
+to check and bump:
+
+```bash
+./scripts/bump-version.sh patch   # 0.1.0 → 0.1.1
+./scripts/bump-version.sh minor   # 0.1.0 → 0.2.0
+./scripts/bump-version.sh major   # 0.1.0 → 1.0.0
+./scripts/bump-version.sh check   # exit non-zero if the two files disagree
+```
+
+The helper edits both files in place. Always inspect with `git diff` before
+committing.
+
+### Bump rules (semver-ish, current `0.x.y`)
+
+- **Logic changes** — `scripts/`, `agents/`, `skills/` → bump **minor**
+  (e.g. `0.2.0` → `0.3.0`). Resets patch to 0.
+- **Docs only** — `README.md`, `CLAUDE.md`, source comments → bump **patch**
+  (e.g. `0.2.0` → `0.2.1`).
+- **Breaking config or skill-arg changes** (e.g. renaming `config.json`
+  fields, changing `/code-reviewer:start` argument syntax) → bump **major**
+  once we are at `1.0.0`. Until then, bump minor and call it out in the
+  commit message.
+
+### Commit procedure (every commit)
+
+```bash
+# 1. Bump both manifest files
+./scripts/bump-version.sh minor   # or patch / major
+
+# 2. Verify they match
+./scripts/bump-version.sh check
+
+# 3. Stage manifests alongside your other changes
+git add .claude-plugin/plugin.json .claude-plugin/marketplace.json
+# ... plus whatever else you changed
+
+# 4. Commit (mention the new version in the message)
+git commit -m "..."
+```
+
+The bump is **mandatory** on every commit. There is no such thing as a "no
+bump needed" change — pick the appropriate severity and bump.
+
+### When working on this repo as Claude
+
+If you are Claude editing this repo and you are about to commit:
+
+1. Run `./scripts/bump-version.sh check` first. If it reports drift, fix it
+   before doing anything else.
+2. Decide the severity based on the rules above. When in doubt between
+   patch and minor, prefer minor — it costs nothing.
+3. Run the appropriate `bump-version.sh <severity>` before staging.
+4. Include the new version number in the commit message subject (e.g.
+   `feat: hand-off prompt and auto-gitignore (v0.2.0)`).
 
 ## Local Testing
 
