@@ -9,6 +9,7 @@
 #   assert_exit          — assert exit code matches
 
 CR_TEST_ROOT="/tmp/cr-test-fixtures/$$"
+mkdir -p "$CR_TEST_ROOT"
 
 setup_fixture_repo() {
   local name="${1:-repo}"
