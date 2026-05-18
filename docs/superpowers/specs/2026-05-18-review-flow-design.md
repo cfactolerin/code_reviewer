@@ -178,7 +178,9 @@ Invariants:
 
 - `head_sha` = `git rev-parse HEAD` at review start.
 - `base_ref` = the symbolic base used for this review (e.g. `origin/main`),
-  exactly as resolved by `cr_base_branch` or as the user passed via `--base`.
+  exactly as resolved by the base resolver (see §5.3 notes for the two
+  distinct chains used by `context.sh` and the hook) or as the user passed
+  via `--base`.
 - `base_sha` = `git rev-parse <base_ref>` at review start. The SHA pins the
   base independently of the symbolic name (which can move).
 - `commits_reviewed` for **Full** = every commit on the branch since
@@ -190,7 +192,10 @@ Invariants:
   ```
   # Tracked changes — full content diff vs HEAD, including binary, deletions,
   # mode changes, symlink target changes. Combines staged + unstaged.
-  TRACKED = git diff HEAD --binary
+  # `--no-ext-diff --no-color --no-textconv` neutralises user gitconfig
+  # (external diff drivers, color output, textconv filters) so the hash is
+  # deterministic across machines and shells.
+  TRACKED = git diff --no-ext-diff --no-color --no-textconv --binary HEAD
 
   # Untracked-file content hashes (respects .gitignore)
   UNTRACKED = for each path in `git ls-files --others --exclude-standard -z`, sorted:
@@ -326,14 +331,45 @@ data. If the two disagree, `findings.json` is authoritative.
 
 ### 3.4 `DISMISSALS.md`
 
-Free-form Markdown, one `## <file>:<line> — <summary>` heading per dismissed
-finding, with a body capturing date and reason. Reviewer agents are told to
-not re-flag a dismissed finding without **new** evidence.
+Markdown with one section per dismissed finding. The heading is human-only;
+machine matching uses a structured **Fingerprint:** line that the parser
+relies on. This keeps the file readable while making the matching unambiguous.
 
-The plugin owns the file location and the suggested format; the main session
-owns the conversational flow that triggers writes. A `scripts/dismiss.sh` helper
-exposes `add`, `remove`, and `list` for consistency; direct file edits also
-work.
+Required section template (helper script writes this; manual edits must
+preserve the `**Fingerprint:**` line):
+
+```markdown
+## src/auth.rs:42 — Missing null check on session token
+
+**Fingerprint:** `src/auth.rs:42:missing_null_check_on_session_token`
+
+Dismissed: 2026-05-18
+Reason: Token is guaranteed non-null by the middleware at
+`src/middleware/auth.rs:18-22`. Reviewer didn't see the middleware.
+```
+
+**Parser rules:**
+
+1. Split the file into sections at each top-level `## ` heading. A section
+   is everything from one `## ` heading up to the next (or EOF).
+2. For each section, find the first line matching the regex
+   `^\*\*Fingerprint:\*\*\s+\`([^\`]+)\`\s*$`. The captured group is the
+   fingerprint. Sections without a `**Fingerprint:**` line are **ignored
+   with a warning** (logged to `context/dismiss.warn` in the round dir;
+   review continues without that dismissal applied).
+3. Fingerprint format: `<file>:<line>:<slug(summary)>` where
+   `slug = lowercase, non-alphanumeric → '_'`. This matches the
+   `fingerprint` field emitted by the arbiter in `findings.json` (§3.3).
+4. Duplicate fingerprints in `DISMISSALS.md` are tolerated (treated as
+   one); the most recent section wins for display.
+
+**`scripts/dismiss.sh` invariants:**
+
+- `add <file:line> "<summary>" "<reason>"` computes the fingerprint
+  deterministically and appends a section with the exact template above.
+- `remove <file:line> [<summary-substring>]` finds matching sections by
+  parsing fingerprints (not headings) and deletes them.
+- `list` prints `<fingerprint> — <date> — <summary>` per dismissal.
 
 Dismissals are branch-scoped and don't follow merges.
 
@@ -579,16 +615,14 @@ def base_compatible(r):
     return True
   return git merge-base --is-ancestor r.base_sha current_base_sha
 
-# 3. Find entries matching FULL state + base compatibility + commit-only
+# 3. Find entries matching state + base compatibility + clean review
 #    `git push` only ships commits — never uncommitted work. So an approval
-#    only authorises a push if the approval was of a CLEAN tree
-#    (worktree_hash == null) AND the current tree is clean.
-if current_worktree_hash != null:
-  deny("commit_needed")  # uncommitted changes locally; commit before push
-
+#    authorises a push when the approval itself was of a CLEAN tree
+#    (worktree_hash == null). The CURRENT worktree state is irrelevant: a
+#    user may have unrelated uncommitted work locally that won't ship.
 matching = [r for r in ledger.reviews
             if r.head_sha == current_head_sha
-            and r.worktree_hash == null              # clean approvals only
+            and r.worktree_hash == null              # clean review only
             and base_compatible(r)]
 
 if not matching:
@@ -655,14 +689,17 @@ Deny reason keys:
 |---|---|
 | Ledger missing | `no_ledger` |
 | HEAD never reviewed at any state | `head_changed` |
-| Uncommitted changes locally, OR HEAD was only reviewed with a dirty worktree | `commit_needed` |
+| HEAD was only reviewed with a dirty worktree (no clean approval exists) | `commit_needed` |
 | Base has commits not covered by the review | `base_drifted` |
 | Latest matching entry's verdict is BLOCK or REQUEST_CHANGES | `not_approved` |
 
-> **Why no `worktree_changed`?** A dirty-tree review never authorises a push,
-> so the only worktree-related deny is `commit_needed`. If the user wants
-> their dirty-state review to gate the push, they must commit the changes
-> and re-review (which will short-circuit if content is unchanged).
+> **Why no `worktree_changed`?** A dirty-tree review never authorises a
+> push (it covers content that isn't being pushed). And the gate doesn't
+> care about the **current** worktree state at all — `git push` only ships
+> commits, so local uncommitted work (related or unrelated) is invisible
+> to the push. The only worktree-related deny is `commit_needed`, which
+> fires when the user's HEAD has *only* been reviewed in dirty states and
+> no clean approval exists.
 
 ### 5.4 Hook output
 
@@ -831,9 +868,9 @@ also includes:
 
 > *This review covered uncommitted changes (`worktree_hash != null`). It
 > does NOT authorise `git push` — pushes only ship commits. Commit the
-> changes and re-run `/code-reviewer:start --delta` (which should
-> short-circuit if the content is the same) so the next review entry has
-> a clean worktree and can gate the push.*
+> changes and re-run `/code-reviewer:start --delta` (a fast incremental
+> review of just the new commit) so the ledger has a clean approval at
+> the new HEAD, which the push gate can use.*
 
 When the report has findings, append:
 
