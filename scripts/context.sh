@@ -58,7 +58,6 @@ TS=$(date +%Y%m%d-%H%M%S)
 REVIEW_OUT=$(cr_review_output_path "$REPO_ROOT")
 REPO_SLUG=$(cr_repo_slug "$REPO_ROOT")
 BRANCH_DIR="$REVIEW_OUT/$REPO_SLUG/$BRANCH_SLUG"
-REVIEWS_ROOT="$REVIEW_OUT/$REPO_SLUG"
 ROUND_DIR="$BRANCH_DIR/$TS"
 CONTEXT_DIR="$ROUND_DIR/context"
 RESULTS_DIR="$ROUND_DIR/results"
@@ -67,17 +66,23 @@ REPRO_DIR="$ROUND_DIR/repro"
 
 mkdir -p "$CONTEXT_DIR" "$RESULTS_DIR" "$REPRO_DIR"
 
-# Make sure the consumer repo ignores plugin output. Idempotent.
-gitignore_path="$REPO_ROOT/.gitignore"
-gitignore_marker="# Added by code-reviewer plugin"
-if ! grep -qE '^(/?tmp/?$|/?tmp/code-reviews/?$|/?tmp/\*\*$)' "$gitignore_path" 2>/dev/null; then
-  {
-    [ -s "$gitignore_path" ] && [ -n "$(tail -c1 "$gitignore_path" 2>/dev/null)" ] && echo ""
-    echo "$gitignore_marker"
-    echo "tmp/code-reviews/"
-  } >> "$gitignore_path"
-  echo "Added tmp/code-reviews/ to $gitignore_path" >&2
-fi
+# Only add to .gitignore when the review output lives inside the repo tree.
+# An absolute path like /tmp/code-reviewer doesn't need gitignoring.
+case "$REVIEW_OUT" in
+  "$REPO_ROOT"/*)
+    rel_review_out="${REVIEW_OUT#$REPO_ROOT/}"
+    gitignore_path="$REPO_ROOT/.gitignore"
+    # Look for an existing line matching the relative path (with or without leading slash, trailing slash).
+    if ! grep -qE "^/?${rel_review_out%/}/?$" "$gitignore_path" 2>/dev/null; then
+      {
+        [ -s "$gitignore_path" ] && [ -n "$(tail -c1 "$gitignore_path" 2>/dev/null)" ] && echo ""
+        echo "# Added by code-reviewer plugin"
+        echo "$rel_review_out/"
+      } >> "$gitignore_path"
+      echo "Added $rel_review_out/ to $gitignore_path" >&2
+    fi
+    ;;
+esac
 
 echo "Repo:    $REPO_ROOT" >&2
 echo "Branch:  $BRANCH" >&2
