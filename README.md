@@ -1,5 +1,7 @@
 # code-reviewer — Pre-Push Multi-Agent Local Branch Review
 
+[![version](https://img.shields.io/badge/dynamic/json?url=https://raw.githubusercontent.com/cfactolerin/code_reviewer/main/.claude-plugin/plugin.json&query=%24.version&label=version&color=blue)](.claude-plugin/plugin.json)
+
 `code-reviewer` is a Claude Code plugin that runs a **non-interactive,
 multi-agent code review on the current local branch before you push it to
 GitHub**. Where `prr` is for the *reviewer* (after a PR is opened),
@@ -107,7 +109,7 @@ issues.
 |---|---|
 | `/code-reviewer:setup` | First-time setup — agent list, Jira credentials, GCP project/location |
 | `/code-reviewer:start [--ticket K] [--base R] [--delta\|--full] [--no-prune]` | Non-interactive multi-agent review of the current branch |
-| `/code-reviewer:autodetect` | Re-detect languages, linters, and test commands without running a full review |
+| `/code-reviewer:autodetect [true\|false]` | Toggle the `git push` review gate (`config.auto_trigger`). No-arg form prints the current state |
 | `/code-reviewer:dismiss <fingerprint>` | Add a finding fingerprint to `DISMISSALS.md` so it is excluded from future gate checks |
 | `/code-reviewer:add-agent <name>` | Enable an agent in your config (`claude`, `codex`, `gemini`, `opencode`) |
 | `/code-reviewer:delete-agent <name>` | Disable an agent in your config |

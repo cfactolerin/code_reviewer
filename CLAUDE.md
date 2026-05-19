@@ -36,7 +36,7 @@ code-reviewer/
 ├── skills/
 │   ├── code-reviewer-setup/SKILL.md
 │   ├── code-reviewer-start/SKILL.md         # v0.4.0: delta/full/no-prune flags + findings.json
-│   ├── code-reviewer-autodetect/SKILL.md    # NEW: re-detect languages/linters without full review
+│   ├── code-reviewer-autodetect/SKILL.md    # NEW: toggle git push review gate (config.auto_trigger)
 │   ├── code-reviewer-dismiss/SKILL.md       # NEW: add fingerprint to DISMISSALS.md
 │   ├── code-reviewer-add-agent/SKILL.md
 │   └── code-reviewer-delete-agent/SKILL.md
