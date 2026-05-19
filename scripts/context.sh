@@ -86,7 +86,7 @@ mkdir -p "$CONTEXT_DIR" "$RESULTS_DIR" "$REPRO_DIR"
 # corrupt the ledger or the round directory listing.
 LOCK_FILE="$BRANCH_DIR/.review-ledger.lock"
 bash "$SCRIPT_DIR/ledger.sh" acquire-lock "$LOCK_FILE" \
-  || { echo "code-reviewer: could not acquire lock at $LOCK_FILE" >&2; exit 1; }
+  || { echo "code-reviewer: could not acquire lock at $LOCK_FILE" >&2; rm -rf "$ROUND_DIR"; exit 1; }
 trap "bash '$SCRIPT_DIR/ledger.sh' release-lock '$LOCK_FILE'" EXIT INT TERM
 
 # Only add to .gitignore when the review output lives inside the repo tree.
@@ -445,7 +445,9 @@ if [ "$NO_PRUNE" = "0" ]; then
   current_ts=$(basename "$ROUND_DIR")
   prev_ts=""
   if [ -f "$LEDGER_FILE" ]; then
-    # The immediately-prior round (the most recent completed review, carry-forward source).
+    # Note: context.sh does NOT append to the ledger; the skill does that AFTER
+    # this script exits. So .[-1] here is the last COMPLETED review, which is
+    # the Delta carry-forward source. Do not change to .[-2].
     prev_ts=$(jq -r '.reviews | if length >= 1 then .[-1].round_dir else "" end' "$LEDGER_FILE")
   fi
 
