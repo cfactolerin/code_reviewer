@@ -733,6 +733,15 @@ End the skill.
   after successful validation.
 - The `findings.json` emitted by the arbiter is the authoritative machine
   artifact. The Markdown `FINAL_REVIEW_RESULTS.md` is for humans only.
+- **Inspecting `findings.json`:** the arbiter writes pretty-printed,
+  multi-line JSON. Always read it with `jq` directly
+  (e.g. `jq '.verdict' "<ROUND_DIR>/findings.json"`,
+  `jq '.findings | length' "<ROUND_DIR>/findings.json"`,
+  `jq -r '.head_sha' "<ROUND_DIR>/findings.json"`). Never pipe through
+  `head` first — `head -1 | jq` will fail because the first line is
+  only `{`. There is no need to "peek" at validity before calling the
+  validator; Phase 6.5 runs `validate-findings.py` which is the
+  authoritative correctness check.
 - When `fallback_reason` cannot be determined from the context manifest
   (context.sh didn't emit a structured field), write JSON `null` in the
   ledger entry. This is a known gap and acceptable for now.
