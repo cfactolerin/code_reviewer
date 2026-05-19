@@ -25,7 +25,8 @@ deviations:
 code-reviewer/
 ├── .claude-plugin/
 │   ├── plugin.json
-│   └── marketplace.json
+│   ├── marketplace.json
+│   └── hooks.json                 # registers the PreToolUse git-push gate
 ├── agents/
 │   ├── claude-reviewer.md
 │   ├── codex-reviewer.md
@@ -34,18 +35,32 @@ code-reviewer/
 │   └── arbiter.md
 ├── skills/
 │   ├── code-reviewer-setup/SKILL.md
-│   ├── code-reviewer-start/SKILL.md
+│   ├── code-reviewer-start/SKILL.md         # v0.4.0: delta/full/no-prune flags + findings.json
+│   ├── code-reviewer-autodetect/SKILL.md    # NEW: re-detect languages/linters without full review
+│   ├── code-reviewer-dismiss/SKILL.md       # NEW: add fingerprint to DISMISSALS.md
 │   ├── code-reviewer-add-agent/SKILL.md
 │   └── code-reviewer-delete-agent/SKILL.md
 ├── scripts/
-│   ├── lib.sh             # shared helpers (config get, base-branch resolution, ...)
-│   ├── context.sh         # gather context: diff, commits, lang/linter detect, jira, prior review
-│   ├── prompt.sh          # build review/arbiter/question prompts
-│   ├── agents.sh          # list/add/delete agents in config
-│   └── jira-fetch.py      # Jira REST + Confluence + HTML→Markdown (stdlib only)
+│   ├── lib.sh                     # shared helpers (config get, base-branch, repo-slug, hash helpers)
+│   ├── context.sh                 # gather context: diff, commits, lang/linter detect, jira, prior review
+│   ├── prompt.sh                  # build review/arbiter/question prompts
+│   ├── agents.sh                  # list/add/delete agents in config
+│   ├── ledger.sh                  # NEW: append/list/render-md/acquire-lock for .review-ledger.json
+│   ├── dismiss.sh                 # NEW: add/remove/list entries in DISMISSALS.md
+│   ├── validate-findings.py       # NEW: 9-rule validator for findings.json (stdlib only)
+│   ├── hooks/
+│   │   └── pre-push.sh            # NEW: PreToolUse hook — gate git push against the ledger
+│   └── jira-fetch.py              # Jira REST + Confluence + attachments + HTML→Markdown (stdlib only)
+├── tests/
+│   ├── run.sh                     # NEW: test runner
+│   ├── lib.sh                     # NEW: test helpers (assert_eq, assert_contains, …)
+│   └── *.test.sh                  # NEW: test suites (11 total)
 ├── README.md
-└── CLAUDE.md              # this file
+└── CLAUDE.md                      # this file
 ```
+
+> **Spec:** `docs/superpowers/specs/2026-05-18-review-flow-design.md` (rev 13) is the
+> authoritative design reference for all v0.4.0 logic. When in doubt, the spec wins.
 
 ## Config
 
@@ -63,22 +78,48 @@ code-reviewer/
   "google_cloud_project": "fuga-prod",
   "google_cloud_location": "europe-west4",
   "base_branch": "",
+  "review_output_path": "/tmp/code-reviewer",
+  "auto_trigger": true,
+  "skip_branches": [],
+  "keep_last_rounds": 10,
   "jira_base_url": "",
   "jira_email": "",
   "jira_api_token": ""
 }
 ```
 
-The fields mirror `prr`'s config; `base_branch` is the only addition (and
-the `workspace_path` field is dropped, since reviews live inside each repo).
+The fields mirror `prr`'s config; `base_branch` and the four v0.4.0 additions
+below are the only differences (and `workspace_path` is dropped, since reviews
+now live in `review_output_path` rather than inside each repo).
 
-## Round Layout
+**New keys added in v0.4.0:**
 
-Per run:
+| Key | Default | Description |
+|---|---|---|
+| `review_output_path` | `/tmp/code-reviewer` | Root for all review output. Set to `~/.cache/code-reviewer` for persistence across reboots. |
+| `auto_trigger` | `true` | When `false`, the `git push` gate is disabled globally. |
+| `skip_branches` | `[]` | Branch names permanently excluded from the push gate (e.g. `["main", "master"]`). |
+| `keep_last_rounds` | `10` | Number of round directories to keep per branch before pruning. Pass `--no-prune` to skip on a run. |
+
+## Storage Layout
+
+Branch-level (persists across rounds):
 
 ```
-<repo>/tmp/code-reviews/<branch_slug>/<YYYYMMDD-HHMMSS>/
-├── FINAL_REVIEW_RESULTS.md
+<review_output_path>/<repo_slug>/<branch_slug>/
+├── .review-ledger.json      # append-only JSON array of review records
+├── REVIEW_LEDGER.md         # human-readable rendering of the ledger
+├── DISMISSALS.md            # fingerprints of dismissed findings (branch-scoped)
+└── .jira-cache/             # Jira issue JSON, attachments, Confluence pages
+```
+
+Per-round directory:
+
+```
+<review_output_path>/<repo_slug>/<branch_slug>/<YYYYMMDD-HHMMSS>/
+├── FINAL_REVIEW_RESULTS.md          # human report (for author / reviewer)
+├── findings.json                    # machine-readable findings emitted by arbiter (§3.3)
+├── prior_findings.json              # carry-forward from previous round (Delta mode only)
 ├── context/
 │   ├── context-manifest.md
 │   ├── commits.md
@@ -88,19 +129,33 @@ Per run:
 │   ├── files-status.txt
 │   ├── languages.txt
 │   ├── linters.json
-│   ├── test-instructions.md
-│   ├── jira.md           # if Jira configured + key found
-│   └── previous-review.md # last FINAL_REVIEW_RESULTS.md on this branch
+│   └── test-instructions.md
 ├── results/
 │   ├── review-prompt.md
 │   ├── <agent>-review.md
 │   ├── arbiter-prompt.md
 │   ├── arbiter-output.md
-│   ├── arbiter-log.md
+│   ├── arbiter-log.md               # Q&A rounds
 │   ├── final-report.md
 │   └── health-check.md
-└── repro/                # repro tests reviewers wrote to prove bugs
+└── repro/                           # repro tests reviewers wrote to prove bugs
 ```
+
+### findings.json schema (§3.3)
+
+The arbiter emits `findings.json` alongside `FINAL_REVIEW_RESULTS.md`. It is
+the **authoritative** source for carry-forward, dismissal matching, and any
+machine consumer. The Markdown report is for humans only — never parse it.
+
+Top-level fields: `round`, `verdict`, `confidence`, `head_sha`, `base_sha`,
+`findings[]`, `open_questions[]`, `regression{}`, `obsolete_dismissals[]`,
+`dismissed_active[]`.
+
+Each `findings[]` entry: `id`, `severity`, `category`, `file`, `line`,
+`end_line`, `summary`, `fingerprint` (`<file>:<line>:<slug(summary)>`),
+`reviewers_agreeing[]`, `carried_from`.
+
+Full schema with example values: spec §3.3.
 
 ## Pipeline Phases (drive from `code-reviewer-start` skill)
 
@@ -116,6 +171,60 @@ Per run:
 The skill tracks round count itself. `prompt.sh arbiter <round_dir> final`
 forces the prompt to instruct the arbiter to finalise (used on the last round
 when questions persist).
+
+## Hook — Pre-Push Gate
+
+`scripts/hooks/pre-push.sh` is registered via `.claude-plugin/hooks.json` as
+a `PreToolUse` hook for `Bash`. It intercepts `git push` commands and checks
+the `.review-ledger.json` for a matching approved review.
+
+### Hook deny reasons
+
+When the gate denies a push, it emits a structured JSON payload with a
+`permissionDecision: "deny"` and one of the following reason codes:
+
+| Reason | Meaning |
+|---|---|
+| `no_ledger` | No `.review-ledger.json` exists for this branch. Run `--full` first. |
+| `head_changed` | New commits exist beyond the last reviewed HEAD. |
+| `commit_needed` | Branch was only reviewed with uncommitted changes. Commit them and re-run `--delta`. |
+| `base_drifted` | The target branch has new commits not covered by the prior review's base SHA. Run `--full`. |
+| `dismissals_changed` | `DISMISSALS.md` changed since the last approval. Re-run `--delta`. |
+| `not_approved` | Latest matching review has a non-passing verdict. |
+
+Six reasons are actually emitted by the hook (the plan mentioned 8 — audit
+of `scripts/hooks/pre-push.sh` found 6 actual `deny` call-sites).
+
+The deny payload also includes four user-facing options Claude must present
+via `AskUserQuestion`: Delta review, Full review, Skip review, Discuss.
+
+### Bypasses
+
+- `CR_SKIP=1 git push` — one-off inline bypass
+- `export CR_SKIP=1` in the shell environment — session bypass
+- `skip_branches` config key — permanent per-branch bypass
+- `auto_trigger: false` config key — disable gate globally
+
+## Validator — findings.json
+
+`scripts/validate-findings.py` implements the 9 validation rules from spec
+§4.5. It is called by the `code-reviewer-start` skill after the arbiter
+writes `findings.json`. If validation fails, the skill retries the arbiter
+**once** with the validation errors appended to the prompt; if it fails again
+the round is aborted and `findings.json.invalid` is written alongside the
+failing file.
+
+The 9 rules (spec §4.5):
+
+1. Parseable JSON (`jq empty`)
+2. Schema required fields present with correct types
+3. Verdict is one of the allowed enum values
+4. Every finding has a valid `fingerprint` in `<file>:<line>:<slug>` format
+5. Every `carried_from` reference resolves to an entry in `prior_findings.json`
+6. Every `dismissed_active` entry has a matching fingerprint in `DISMISSALS.md`
+7. Every entry in `prior_findings.json` appears in exactly one of: `findings[]`, `dismissed_active[]`, or `regression.resolved[]`
+8. No duplicate fingerprints in `findings[]`
+9. No dismissed finding silently dropped — every DISMISSALS.md fingerprint accounted for
 
 ## Conventions
 
@@ -235,7 +344,7 @@ In a project with a feature branch:
 2. Run `/code-reviewer:setup` once.
 3. Make some local changes on a non-protected branch.
 4. Run `/code-reviewer:start`.
-5. Inspect `tmp/code-reviews/<branch>/<ts>/`.
+5. Inspect `<review_output_path>/<repo-slug>/<branch-slug>/<ts>/` (default: `/tmp/code-reviewer/`).
 
 Iterate: edit scripts under `scripts/`, re-run `/code-reviewer:start`. No
 rebuild step.
