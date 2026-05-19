@@ -397,20 +397,20 @@ if [ "$MODE" = "full" ] && [ -n "$ticket" ] && [ -n "$jira_base" ] && [ -n "$jir
   rm -rf "$BRANCH_DIR/.jira-cache.new" "$BRANCH_DIR/.jira-cache.old"
   mkdir -p "$BRANCH_DIR/.jira-cache.new"
   if CR_JIRA_BASE_URL="$jira_base" CR_JIRA_EMAIL="$jira_email" CR_JIRA_API_TOKEN="$jira_token" \
-     python3 "$SCRIPT_DIR/jira-fetch.py" "$ticket" --out "$BRANCH_DIR/.jira-cache.new/jira.md" \
+     python3 "$SCRIPT_DIR/jira-fetch.py" "$ticket" --out-dir "$BRANCH_DIR/.jira-cache.new" --mode "$MODE" \
      >/dev/null 2>"$CONTEXT_DIR/jira.err"; then
     [ -d "$BRANCH_DIR/.jira-cache" ] && mv "$BRANCH_DIR/.jira-cache" "$BRANCH_DIR/.jira-cache.old"
     mv "$BRANCH_DIR/.jira-cache.new" "$BRANCH_DIR/.jira-cache"
     rm -rf "$BRANCH_DIR/.jira-cache.old"
-    cp "$BRANCH_DIR/.jira-cache/jira.md" "$CONTEXT_DIR/jira.md"
+    cp "$BRANCH_DIR/.jira-cache/$ticket.md" "$CONTEXT_DIR/jira.md"
   else
     rm -rf "$BRANCH_DIR/.jira-cache.new"
     # If a stale cache exists, copy it as a fallback
-    [ -f "$BRANCH_DIR/.jira-cache/jira.md" ] && cp "$BRANCH_DIR/.jira-cache/jira.md" "$CONTEXT_DIR/jira.md"
+    [ -f "$BRANCH_DIR/.jira-cache/$ticket.md" ] && cp "$BRANCH_DIR/.jira-cache/$ticket.md" "$CONTEXT_DIR/jira.md"
     echo "Jira refresh failed; using stale cache if available. See $CONTEXT_DIR/jira.err" >> "$CONTEXT_DIR/jira.warn"
   fi
-elif [ "$MODE" = "delta" ] && [ -f "$BRANCH_DIR/.jira-cache/jira.md" ]; then
-  cp "$BRANCH_DIR/.jira-cache/jira.md" "$CONTEXT_DIR/jira.md"
+elif [ "$MODE" = "delta" ] && [ -f "$BRANCH_DIR/.jira-cache/$ticket.md" ]; then
+  cp "$BRANCH_DIR/.jira-cache/$ticket.md" "$CONTEXT_DIR/jira.md"
 fi
 
 # ---- Manifest -------------------------------------------------------------

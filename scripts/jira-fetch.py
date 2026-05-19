@@ -3,7 +3,7 @@
 Fetch a Jira issue (and any linked Confluence pages) and emit a Markdown summary.
 
 Usage:
-  jira-fetch.py <ISSUE_KEY> [--out <path>]
+  jira-fetch.py <ISSUE_KEY> --out-dir <dir> [--mode {delta,full}]
 
 Reads credentials from environment:
   CR_JIRA_BASE_URL, CR_JIRA_EMAIL, CR_JIRA_API_TOKEN
@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
+from pathlib import Path
 
 CONFLUENCE_LINK_RE = re.compile(r"https?://[^\s\"'>)]+/wiki/[^\s\"'>)]+")
 
@@ -206,12 +207,35 @@ def fetch_issue(base_url: str, key: str, email: str, token: str) -> dict | None:
     return http_get_json(url, email, token)
 
 
-def fetch_confluence_page(page_url: str, email: str, token: str) -> str | None:
+def download_attachment(att: dict, dest_dir: Path, email: str, token: str) -> bool:
+    url = att.get("content")
+    name = att.get("filename") or att.get("id", "attachment")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    out = dest_dir / safe_name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(url, headers={
+        "Authorization": auth_header(email, token),
+        "User-Agent": "code-reviewer/0.4",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            with open(out, "wb") as f:
+                f.write(resp.read())
+        return True
+    except Exception as e:
+        sys.stderr.write(f"[jira-fetch] attachment {name}: {type(e).__name__}: {e}\n")
+        return False
+
+
+def fetch_confluence_page(page_url: str, email: str, token: str, out_dir: Path, mode: str) -> str | None:
     m = re.search(r"/wiki/(?:spaces/[^/]+/)?pages/(\d+)", page_url)
     if not m:
         return None
     base = page_url.split("/wiki/")[0]
     page_id = m.group(1)
+    cache_path = out_dir / "confluence" / f"{page_id}.md"
+    if mode == "delta" and cache_path.exists():
+        return cache_path.read_text(encoding="utf-8")
     api = f"{base}/wiki/api/v2/pages/{page_id}?body-format=storage"
     data = http_get_json(api, email, token)
     if not data:
@@ -219,10 +243,14 @@ def fetch_confluence_page(page_url: str, email: str, token: str) -> str | None:
     title = data.get("title", page_id)
     storage = (data.get("body", {}) or {}).get("storage", {}).get("value", "")
     md = html_to_markdown(storage)
-    return f"### Confluence: {title}\n\nSource: {page_url}\n\n{md}\n"
+    rendered = f"### Confluence: {title}\n\nSource: {page_url}\n\n{md}\n"
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(rendered, encoding="utf-8")
+    return rendered
 
 
-def render_issue_markdown(issue: dict, base_url: str, email: str, token: str) -> str:
+def render_issue_markdown(issue: dict, base_url: str, email: str, token: str,
+                          out_dir: Path, mode: str) -> str:
     fields = issue.get("fields", {}) or {}
     rendered = issue.get("renderedFields", {}) or {}
     key = issue.get("key", "")
@@ -268,6 +296,21 @@ def render_issue_markdown(issue: dict, base_url: str, email: str, token: str) ->
                 md_body = render_adf(c.get("body")).strip()
             parts.append(f"**{author}:**\n\n{md_body}\n")
 
+    attachments = fields.get("attachment") or []
+    if attachments:
+        parts.append("\n## Attachments\n")
+        att_dir = out_dir / key / "attachments"
+        for att in attachments:
+            fname = att.get("filename") or att.get("id", "?")
+            safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", fname)
+            cached = (att_dir / safe_name).exists()
+            if mode == "delta" and cached:
+                ok = True
+            else:
+                ok = download_attachment(att, att_dir, email, token)
+            marker = "✓" if ok else "✗"
+            parts.append(f"- {marker} `{fname}` — saved to `{att_dir}/`\n")
+
     confluence_urls = set(CONFLUENCE_LINK_RE.findall(desc_html))
     for c in comments:
         body_html = render_adf(c.get("body"))
@@ -276,7 +319,7 @@ def render_issue_markdown(issue: dict, base_url: str, email: str, token: str) ->
     if confluence_urls:
         parts.append("\n## Linked Confluence Pages\n")
         for url in sorted(confluence_urls):
-            md = fetch_confluence_page(url, email, token)
+            md = fetch_confluence_page(url, email, token, out_dir, mode)
             if md:
                 parts.append(md)
             else:
@@ -288,7 +331,9 @@ def render_issue_markdown(issue: dict, base_url: str, email: str, token: str) ->
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fetch a Jira issue as Markdown.")
     parser.add_argument("key", help="Jira issue key, e.g. ABC-123")
-    parser.add_argument("--out", help="Write markdown to this path instead of stdout")
+    parser.add_argument("--out-dir", required=True, help="cache directory to populate")
+    parser.add_argument("--mode", choices=["delta", "full"], default="delta",
+                        help="full re-downloads everything; delta skips files that already exist")
     args = parser.parse_args()
 
     base_url = os.environ.get("CR_JIRA_BASE_URL", "").strip()
@@ -301,19 +346,18 @@ def main() -> int:
         )
         return 2
 
+    out_dir = Path(args.out_dir)
+
     issue = fetch_issue(base_url, args.key, email, token)
     if issue is None:
         msg = f"# Jira: {args.key}\n\n_(could not fetch — see stderr)_\n"
     else:
-        msg = render_issue_markdown(issue, base_url, email, token)
+        msg = render_issue_markdown(issue, base_url, email, token, out_dir, args.mode)
 
-    if args.out:
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(msg)
-        print(args.out)
-    else:
-        sys.stdout.write(msg)
+    out_md = out_dir / f"{args.key}.md"
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+    out_md.write_text(msg, encoding="utf-8")
+    print(out_md)
     return 0
 
 
