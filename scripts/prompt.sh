@@ -409,6 +409,86 @@ HDR
         echo
       fi
 
+      cat <<'SCHEMA'
+## findings.json — emit per spec §3.3
+
+Your output is two files:
+1. `<round_dir>/findings.json` — machine-readable per §3.3 schema. AUTHORITATIVE for validation and carry-forward.
+2. `<round_dir>/FINAL_REVIEW_RESULTS.md` — human-readable rendering of the same data.
+
+If the two disagree, findings.json is authoritative. Validation (§4.5) will reject malformed JSON; on failure the orchestrator retries once with the validation errors fed back.
+
+### Schema (§3.3)
+
+Top-level required fields:
+- `round` (string): timestamp identifier.
+- `verdict` (string): APPROVE | APPROVE_WITH_COMMENTS | REQUEST_CHANGES | BLOCK.
+- `confidence` (string): HIGH | MEDIUM | LOW.
+- `head_sha`, `base_sha` (string).
+- `findings` (array): active findings with severity CRITICAL/HIGH/MEDIUM/LOW.
+- `open_questions` (array): each with {id, category, file, line, summary}.
+  Categories: IntentAmbiguity | MissingContext | ConflictingSignals | OutOfScopeConcern.
+- `regression` (object): {resolved: [string], newly_introduced: [string]}. Refs use `<round>:<id>` shape.
+- `dismissed_active` (array): findings whose code still exists in the branch but are suppressed via DISMISSALS.md.
+- `obsolete_dismissals` (array): {fingerprint, reason} for DISMISSALS.md entries no longer applicable.
+
+Per-finding required fields: id (matches `F[0-9]+`), severity, category, file, line (positive int), end_line (int or null), summary, fingerprint (`<file>:<line>:<slug(summary)>`), reviewers_agreeing (array of strings), carried_from (string or null).
+
+Per dismissed_active entry: id (matches `D[0-9]+`), ref (string or null), fingerprint, severity, category, file, line, end_line, summary.
+
+### verdict rubric (§7)
+
+Apply mechanically to `findings[]` only — `dismissed_active[]` does NOT count toward the verdict:
+- Any CRITICAL → BLOCK
+- Any HIGH (no CRITICAL) → REQUEST_CHANGES
+- Only MEDIUM/LOW → APPROVE_WITH_COMMENTS
+- No findings → APPROVE
+
+**Linter output is never the basis for the verdict.** Treat linter findings as evidence; only manual findings drive severity.
+
+### Validation rules (§4.5)
+
+The validator will reject your output if any of the following fail:
+1. JSON parses cleanly.
+2. All required fields present with correct types.
+3. Enums match.
+4. Verdict matches the rubric for findings[].
+5. (Delta only) Every prior entry from `prior_findings.json` appears in exactly one of: `findings[].carried_from`, `dismissed_active[].ref`, or `regression.resolved`.
+6. Dismissal coherence: no finding fingerprint matches an active DISMISSALS.md entry; every `dismissed_active` entry matches one.
+7. Fingerprints match `<file>:<line>:<slug>`.
+8. Fingerprints unique across `findings[]` ∪ `dismissed_active[]`.
+9. Every DISMISSALS.md fingerprint is classified in either `dismissed_active` or `obsolete_dismissals`.
+
+SCHEMA
+
+      if [ -f "$round_dir/prior_findings.json" ]; then
+        echo "## Prior Findings (Delta — carry-forward source: prior_findings.json)"
+        echo
+        echo "This is the union of the previous round's findings and dismissed_active entries."
+        echo "Every entry below must appear in exactly ONE of:"
+        echo
+        echo "1. \`findings[]\` with \`carried_from\` set to \`\"<round>:<id>\"\` (issue still present)."
+        echo "2. \`dismissed_active[]\` with \`ref\` set to \`\"<round>:<id>\"\` (issue still present, suppressed via DISMISSALS.md)."
+        echo "3. \`regression.resolved\` referencing \`\"<round>:<id>\"\` (issue fixed)."
+        echo
+        echo "No prior entry may be silently dropped."
+        echo
+        echo '```json'
+        cat "$round_dir/prior_findings.json"
+        echo '```'
+        echo
+      else
+        echo "## Dismissal Accounting (Full mode)"
+        echo
+        echo "Every \`**Fingerprint:**\` line in DISMISSALS.md must be classified in exactly one of:"
+        echo
+        echo "1. \`dismissed_active[]\` — issue still present in the branch, suppression valid."
+        echo "2. \`obsolete_dismissals[]\` — issue no longer applicable (file removed, code rewritten, etc.), with a short \`reason\`."
+        echo
+        echo "Missing or unclassified dismissals will fail validation rule 9."
+        echo
+      fi
+
       echo "## Context Manifest"
       echo
       slurp "$context_dir/context-manifest.md"
