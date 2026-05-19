@@ -84,6 +84,19 @@ linter output you reproduced or repro test you wrote.
 
 ### F2. ...
 
+## Open Questions
+
+For genuine intent/scope ambiguities that you cannot resolve from the diff and
+context alone, list them here — do NOT mask uncertainty inside Findings. Each
+Open Question uses this template:
+
+### OQ1. <one-line summary>
+- **ID:** OQ1
+- **Category:** IntentAmbiguity | MissingContext | ConflictingSignals | OutOfScopeConcern
+- **File:** `<path>:<line>` (or omit if not file-specific)
+- **Question:** The precise question the arbiter should route back to you or
+  escalate to the author.
+
 ## Test Coverage Gaps
 
 For each new or changed function/class that lacks a corresponding test, list:
@@ -128,6 +141,13 @@ If a previous review on this branch was supplied, list:
 - **Cite line numbers.** Every finding has `<path>:<line>` (or a range).
 - **Be conservative on style nits.** A handful at the end is fine; do not
   drown the implementing agent in cosmetic noise.
+- **Linter output is never the basis for the verdict.** Treat linter output as
+  evidence, not findings. The verdict rubric is determined by manual findings
+  (CRITICAL/HIGH/MEDIUM/LOW); linter output supplements them but cannot
+  escalate or set the verdict.
+- **Honour the Previously Dismissed Findings section.** If a finding matches
+  one of those fingerprints (`<file>:<line>:<slug(summary)>`), do NOT re-flag
+  it unless you have new evidence that was not present when it was dismissed.
 
 ---
 
@@ -183,6 +203,16 @@ HDR
         echo '```'
         echo
       fi
+      if [ -f "$context_dir/dismissals.md" ] || [ -f "${BRANCH_DIR:-}/DISMISSALS.md" ]; then
+        echo "## Previously Dismissed Findings (do not re-flag without new evidence)"
+        echo
+        if [ -f "$context_dir/dismissals.md" ]; then
+          cat "$context_dir/dismissals.md"
+        else
+          cat "${BRANCH_DIR:-}/DISMISSALS.md"
+        fi
+        echo
+      fi
       echo "## Repro Test Directory"
       echo
       echo "Write any repro tests for bugs you find under:"
@@ -196,6 +226,18 @@ HDR
       echo '```diff'
       slurp "$context_dir/diff.patch"
       echo '```'
+      echo
+      echo "## Output Requirements"
+      echo
+      echo "Your individual review is consumed by the arbiter, which consolidates the"
+      echo "reviews into a single authoritative \`findings.json\` (per spec §3.3 schema)"
+      echo "and \`FINAL_REVIEW_RESULTS.md\`. To make consolidation accurate, ensure every"
+      echo "finding in your review carries the fields the arbiter will need: severity,"
+      echo "category, file, line, summary, and a deterministic identity (the arbiter"
+      echo "computes a fingerprint as \`<file>:<line>:<slug(summary)>\`). The arbiter's"
+      echo "findings.json will be validated against §4.5 rules and on failure your"
+      echo "individual review will be re-examined for inconsistencies, so prefer"
+      echo "precision over completeness."
     } > "$out"
     echo "$out"
     ;;
