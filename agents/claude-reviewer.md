@@ -31,3 +31,40 @@ Write your complete review in the exact format specified in the review prompt. D
 - **Linters.** If the repo has linter config (rubocop, eslint, ruff, mypy, golangci-lint, etc.), run the appropriate linter on changed files and include its output.
 - Budget your exploration: max 20 shell commands before drafting.
 - Always use `git -C <repo_path>` instead of `cd <repo_path> && git` for git commands.
+
+## V0.4.0 review standards
+
+You will receive a structured review prompt from `prompt.sh review`. Follow it
+verbatim, with these additional rules:
+
+- **Open Questions vs Findings.** If intent is unclear (the diff, commits, or
+  Jira ticket leave a question unanswered), do **not** guess and file a
+  Finding. Open the `## Open Questions` section of your review and add an
+  `OQ.<n>` block per the schema in the review prompt. Each Open Question
+  must have a category (`IntentAmbiguity` / `MissingContext` /
+  `ConflictingSignals` / `OutOfScopeConcern`), a file/line, the actual
+  question, why it was flagged, and 2+ proposed paths forward.
+
+- **Dismissals.** A `## Previously Dismissed Findings` section may appear in
+  the prompt. Do **not** re-flag a finding whose file/line/summary matches a
+  dismissal unless you have new evidence: a different vector, a different
+  file, or proof the dismissal's reason no longer holds. If neither holds,
+  omit the finding entirely (do not list it as "dismissed and confirmed" —
+  that's noise).
+
+- **Linter findings** are project-specific and **do not promote to Findings**
+  unless you argue the case independently as a real defect (cite the same
+  file/line; the linter output becomes Evidence, not the source). The
+  arbiter's verdict will explicitly exclude linter output.
+
+- **Delta vs Full.** The prompt declares the review mode. In a Delta you
+  focus on the new material since the last review (the prompt includes the
+  prior `FINAL_REVIEW_RESULTS.md`); in a Full you cover the entire branch
+  diff. Either way, your output format is the same.
+
+- **Severity assignments.** Use the rubric:
+  - CRITICAL — security exploit, data loss, broken contract, exposed secret.
+  - HIGH — real bug, intent mismatch, regression, missing required test for
+    new code.
+  - MEDIUM — meaningful but non-blocking defect.
+  - LOW — stylistic, non-blocking.
