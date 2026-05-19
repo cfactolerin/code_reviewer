@@ -75,6 +75,15 @@ if [ "$MODE" = "delta" ] && [ ! -f "$LEDGER_FILE" ]; then
 fi
 
 ROUND_DIR="$BRANCH_DIR/$TS"
+# Handle same-second invocations: append -2, -3, ... until we find an unused dir.
+if [ -d "$ROUND_DIR" ]; then
+  suffix=2
+  while [ -d "$BRANCH_DIR/$TS-$suffix" ]; do
+    suffix=$((suffix + 1))
+  done
+  TS="$TS-$suffix"
+  ROUND_DIR="$BRANCH_DIR/$TS"
+fi
 CONTEXT_DIR="$ROUND_DIR/context"
 RESULTS_DIR="$ROUND_DIR/results"
 REPRO_DIR="$ROUND_DIR/repro"
@@ -452,11 +461,13 @@ if [ "$NO_PRUNE" = "0" ]; then
   fi
 
   # Enumerate timestamp dirs; sort newest first. Use find to avoid ls color codes.
+  # Pattern: YYYYMMDD-HHMMSS with an optional -N suffix (same-second runs).
   dirs=()
   while IFS= read -r d; do
-    [ -n "$d" ] && dirs+=("$(basename "$d")")
+    bname="$(basename "$d")"
+    [[ "$bname" =~ ^[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || continue
+    dirs+=("$bname")
   done < <(find "$BRANCH_DIR" -maxdepth 1 -mindepth 1 -type d \
-             -name '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]' \
              2>/dev/null | sort -r)
 
   preserved=("$current_ts")
