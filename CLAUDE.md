@@ -107,7 +107,7 @@ Branch-level (persists across rounds):
 
 ```
 <review_output_path>/<repo_slug>/<branch_slug>/
-├── .review-ledger.json      # append-only JSON array of review records
+├── .review-ledger.json      # JSON object {branch, base_ref, jira_keys, jira_cached_at, reviews:[…]} — review records are under .reviews[]
 ├── REVIEW_LEDGER.md         # human-readable rendering of the ledger
 ├── DISMISSALS.md            # fingerprints of dismissed findings (branch-scoped)
 └── .jira-cache/             # Jira issue JSON, attachments, Confluence pages

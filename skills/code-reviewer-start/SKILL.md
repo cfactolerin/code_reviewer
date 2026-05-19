@@ -733,6 +733,14 @@ End the skill.
   after successful validation.
 - The `findings.json` emitted by the arbiter is the authoritative machine
   artifact. The Markdown `FINAL_REVIEW_RESULTS.md` is for humans only.
+- **Ledger shape (`.review-ledger.json`):** the file is a JSON **object**,
+  not a top-level array. Schema:
+  `{ "branch": "...", "base_ref": "...", "jira_keys": [], "jira_cached_at": null, "reviews": [ … ] }`.
+  Review records live under `.reviews[]`. To grab the latest review use
+  `jq '.reviews[-1]' "<BRANCH_DIR>/.review-ledger.json"`. Never query
+  `.[N]` or `.[-1]` against the root — that produces `Cannot index object
+  with number`. The `pre-push.sh` hook is the reference example for
+  correct queries (`scripts/hooks/pre-push.sh`).
 - **Inspecting `findings.json`:** the arbiter writes pretty-printed,
   multi-line JSON. Always read it with `jq` directly
   (e.g. `jq '.verdict' "<ROUND_DIR>/findings.json"`,
