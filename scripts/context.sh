@@ -21,12 +21,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 base_override=""
 ticket_override=""
 MODE=""
+NO_PRUNE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base_override="$2"; shift 2 ;;
     --ticket) ticket_override="$2"; shift 2 ;;
     --delta) MODE="delta"; shift ;;
     --full)  MODE="full"; shift ;;
+    --no-prune) NO_PRUNE=1; shift ;;
     *) echo "context.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -79,6 +81,13 @@ REPRO_DIR="$ROUND_DIR/repro"
 
 
 mkdir -p "$CONTEXT_DIR" "$RESULTS_DIR" "$REPRO_DIR"
+
+# Acquire per-branch lock so concurrent reviews on the same branch don't
+# corrupt the ledger or the round directory listing.
+LOCK_FILE="$BRANCH_DIR/.review-ledger.lock"
+bash "$SCRIPT_DIR/ledger.sh" acquire-lock "$LOCK_FILE" \
+  || { echo "code-reviewer: could not acquire lock at $LOCK_FILE" >&2; exit 1; }
+trap "bash '$SCRIPT_DIR/ledger.sh' release-lock '$LOCK_FILE'" EXIT INT TERM
 
 # Only add to .gitignore when the review output lives inside the repo tree.
 # An absolute path like /tmp/code-reviewer doesn't need gitignoring.
@@ -372,14 +381,27 @@ jira_base=$(cr_config_get jira_base_url "")
 jira_email=$(cr_config_get jira_email "")
 jira_token=$(cr_config_get jira_api_token "")
 
-if [ -n "$ticket" ] && [ -n "$jira_base" ] && [ -n "$jira_email" ] && [ -n "$jira_token" ]; then
-  echo "Fetching Jira ticket $ticket..."
-  CR_JIRA_BASE_URL="$jira_base" CR_JIRA_EMAIL="$jira_email" CR_JIRA_API_TOKEN="$jira_token" \
-    python3 "$SCRIPT_DIR/jira-fetch.py" "$ticket" --out "$CONTEXT_DIR/jira.md" >/dev/null 2>"$CONTEXT_DIR/jira.err" || true
-  if [ ! -s "$CONTEXT_DIR/jira.md" ]; then
-    echo "Jira fetch failed (see $CONTEXT_DIR/jira.err). Continuing without ticket context." >&2
-    rm -f "$CONTEXT_DIR/jira.md"
+# Jira fetch — guarded by mode and config. Write to .jira-cache.new/, swap on success.
+# In delta mode, re-use the branch-level cache rather than fetching again.
+if [ "$MODE" = "full" ] && [ -n "$ticket" ] && [ -n "$jira_base" ] && [ -n "$jira_email" ] && [ -n "$jira_token" ]; then
+  echo "Fetching Jira ticket $ticket..." >&2
+  rm -rf "$BRANCH_DIR/.jira-cache.new" "$BRANCH_DIR/.jira-cache.old"
+  mkdir -p "$BRANCH_DIR/.jira-cache.new"
+  if CR_JIRA_BASE_URL="$jira_base" CR_JIRA_EMAIL="$jira_email" CR_JIRA_API_TOKEN="$jira_token" \
+     python3 "$SCRIPT_DIR/jira-fetch.py" "$ticket" --out "$BRANCH_DIR/.jira-cache.new/jira.md" \
+     >/dev/null 2>"$CONTEXT_DIR/jira.err"; then
+    [ -d "$BRANCH_DIR/.jira-cache" ] && mv "$BRANCH_DIR/.jira-cache" "$BRANCH_DIR/.jira-cache.old"
+    mv "$BRANCH_DIR/.jira-cache.new" "$BRANCH_DIR/.jira-cache"
+    rm -rf "$BRANCH_DIR/.jira-cache.old"
+    cp "$BRANCH_DIR/.jira-cache/jira.md" "$CONTEXT_DIR/jira.md"
+  else
+    rm -rf "$BRANCH_DIR/.jira-cache.new"
+    # If a stale cache exists, copy it as a fallback
+    [ -f "$BRANCH_DIR/.jira-cache/jira.md" ] && cp "$BRANCH_DIR/.jira-cache/jira.md" "$CONTEXT_DIR/jira.md"
+    echo "Jira refresh failed; using stale cache if available. See $CONTEXT_DIR/jira.err" >> "$CONTEXT_DIR/jira.warn"
   fi
+elif [ "$MODE" = "delta" ] && [ -f "$BRANCH_DIR/.jira-cache/jira.md" ]; then
+  cp "$BRANCH_DIR/.jira-cache/jira.md" "$CONTEXT_DIR/jira.md"
 fi
 
 # ---- Manifest -------------------------------------------------------------
@@ -413,3 +435,51 @@ fi
 
 echo "Context gathered." >&2
 echo "$ROUND_DIR"
+
+# Pruning is the LAST step on a successful run. The lock is released by the
+# trap that fires after this exits.
+if [ "$NO_PRUNE" = "0" ]; then
+  KEEP=$(cr_config_get keep_last_rounds 10)
+  if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then KEEP=1; fi
+
+  current_ts=$(basename "$ROUND_DIR")
+  prev_ts=""
+  if [ -f "$LEDGER_FILE" ]; then
+    # The immediately-prior round (the most recent completed review, carry-forward source).
+    prev_ts=$(jq -r '.reviews | if length >= 1 then .[-1].round_dir else "" end' "$LEDGER_FILE")
+  fi
+
+  # Enumerate timestamp dirs; sort newest first. Use find to avoid ls color codes.
+  dirs=()
+  while IFS= read -r d; do
+    [ -n "$d" ] && dirs+=("$(basename "$d")")
+  done < <(find "$BRANCH_DIR" -maxdepth 1 -mindepth 1 -type d \
+             -name '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]' \
+             2>/dev/null | sort -r)
+
+  preserved=("$current_ts")
+  [ -n "$prev_ts" ] && preserved+=("$prev_ts")
+  count=${#preserved[@]}
+  for d in "${dirs[@]+"${dirs[@]}"}"; do
+    in_preserve=0
+    for p in "${preserved[@]}"; do
+      [ "$d" = "$p" ] && in_preserve=1 && break
+    done
+    if [ "$in_preserve" = "0" ]; then
+      if [ "$count" -lt "$KEEP" ]; then
+        preserved+=("$d")
+        count=$((count + 1))
+      fi
+    fi
+  done
+  # Remove anything not preserved.
+  for d in "${dirs[@]+"${dirs[@]}"}"; do
+    in_preserve=0
+    for p in "${preserved[@]}"; do
+      [ "$d" = "$p" ] && in_preserve=1 && break
+    done
+    if [ "$in_preserve" = "0" ]; then
+      rm -rf "$BRANCH_DIR/$d"
+    fi
+  done
+fi
