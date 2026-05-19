@@ -20,10 +20,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 base_override=""
 ticket_override=""
+MODE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) base_override="$2"; shift 2 ;;
     --ticket) ticket_override="$2"; shift 2 ;;
+    --delta) MODE="delta"; shift ;;
+    --full)  MODE="full"; shift ;;
     *) echo "context.sh: unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -58,6 +61,17 @@ TS=$(date +%Y%m%d-%H%M%S)
 REVIEW_OUT=$(cr_review_output_path "$REPO_ROOT")
 REPO_SLUG=$(cr_repo_slug "$REPO_ROOT")
 BRANCH_DIR="$REVIEW_OUT/$REPO_SLUG/$BRANCH_SLUG"
+
+# Mode selection: --delta or --full, default = delta if ledger exists, else full.
+LEDGER_FILE="$BRANCH_DIR/.review-ledger.json"
+if [ -z "$MODE" ]; then
+  if [ -f "$LEDGER_FILE" ]; then MODE="delta"; else MODE="full"; fi
+fi
+if [ "$MODE" = "delta" ] && [ ! -f "$LEDGER_FILE" ]; then
+  echo "code-reviewer: no prior review on this branch — run with --full first" >&2
+  exit 1
+fi
+
 ROUND_DIR="$BRANCH_DIR/$TS"
 CONTEXT_DIR="$ROUND_DIR/context"
 RESULTS_DIR="$ROUND_DIR/results"
@@ -106,6 +120,62 @@ CHANGED_COUNT=$(wc -l < "$CONTEXT_DIR/files.txt" | tr -d ' ')
 if [ "$CHANGED_COUNT" = "0" ]; then
   echo "No files changed between $BASE and HEAD. Nothing to review." >&2
   exit 1
+fi
+
+# ---- Delta machinery -------------------------------------------------------
+# Delta: read prior round, build prior_findings.json, check rebase / base compat.
+if [ "$MODE" = "delta" ]; then
+  prev=$(jq -r '.reviews[-1]' "$LEDGER_FILE")
+  prev_round_dir=$(echo "$prev" | jq -r '.round_dir')
+  prev_findings_json="$BRANCH_DIR/$prev_round_dir/findings.json"
+  prev_head_sha=$(echo "$prev" | jq -r '.head_sha')
+  prev_base_sha=$(echo "$prev" | jq -r '.base_sha // empty')
+
+  # Rebase detection
+  if ! git -C "$REPO_ROOT" merge-base --is-ancestor "$prev_head_sha" HEAD 2>/dev/null; then
+    echo "code-reviewer: prev HEAD not ancestor of current HEAD — falling back to FULL" >&2
+    MODE="full"
+  fi
+
+  # Base compatibility
+  if [ "$MODE" = "delta" ]; then
+    current_base_sha=$(git -C "$REPO_ROOT" rev-parse "$BASE" 2>/dev/null || echo "")
+    if [ -n "$prev_base_sha" ] && [ -n "$current_base_sha" ] && [ "$prev_base_sha" != "$current_base_sha" ]; then
+      echo "code-reviewer: base shifted ($prev_base_sha -> $current_base_sha) — falling back to FULL" >&2
+      MODE="full"
+    fi
+  fi
+
+  # Prior findings.json available?
+  if [ "$MODE" = "delta" ] && [ ! -f "$prev_findings_json" ]; then
+    echo "code-reviewer: prior findings.json missing — falling back to FULL" >&2
+    MODE="full"
+  fi
+
+  # Nothing-new short-circuit
+  if [ "$MODE" = "delta" ]; then
+    current_worktree_hash=$(cd "$REPO_ROOT" && cr_worktree_hash)
+    prev_worktree_hash=$(echo "$prev" | jq -r '.worktree_hash // empty')
+    new_commits=$(git -C "$REPO_ROOT" rev-list "${prev_head_sha}..HEAD" 2>/dev/null | wc -l | tr -d ' ')
+    current_dismissals_hash=$(cr_dismissals_hash "$BRANCH_DIR/DISMISSALS.md")
+    prev_dismissals_hash=$(echo "$prev" | jq -r '.dismissals_hash // empty')
+    if [ "$new_commits" = "0" ] \
+       && [ "$current_worktree_hash" = "$prev_worktree_hash" ] \
+       && [ "$current_dismissals_hash" = "$prev_dismissals_hash" ]; then
+      prev_verdict=$(echo "$prev" | jq -r '.verdict')
+      echo "Nothing new to review since $prev_round_dir (last verdict: $prev_verdict)." >&2
+      # Remove the freshly-created round dir; we're not running a review.
+      rm -rf "$ROUND_DIR"
+      exit 0
+    fi
+
+    # Build prior_findings.json
+    jq --arg round "$prev_round_dir" '
+      ((.findings // []) | map(. + {_was_dismissed: false, _round: $round}))
+      +
+      ((.dismissed_active // []) | map(. + {_was_dismissed: true, _round: $round}))
+    ' "$prev_findings_json" > "$ROUND_DIR/prior_findings.json"
+  fi
 fi
 
 # ---- Commits with full messages (so reviewers see intent) -----------------
@@ -322,6 +392,7 @@ fi
   echo "| Repo | \`$REPO_ROOT\` |"
   echo "| Branch | \`$BRANCH\` |"
   echo "| Base | \`$BASE\` |"
+  echo "| Mode | $MODE |"
   echo "| Merge base | \`$(echo "$MERGE_BASE" | cut -c1-12)\` |"
   echo "| Commits | $COMMIT_COUNT |"
   echo "| Files changed | $CHANGED_COUNT |"
