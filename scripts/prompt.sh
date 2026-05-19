@@ -432,9 +432,13 @@ Top-level required fields:
 - `dismissed_active` (array): findings whose code still exists in the branch but are suppressed via DISMISSALS.md.
 - `obsolete_dismissals` (array): {fingerprint, reason} for DISMISSALS.md entries no longer applicable.
 
-Per-finding required fields: id (matches `F[0-9]+`), severity, category, file, line (positive int), end_line (int or null), summary, fingerprint (`<file>:<line>:<slug(summary)>`), reviewers_agreeing (array of strings), carried_from (string or null).
+Per-finding required fields: id (matches `F[0-9]+`), `severity` (one of CRITICAL, HIGH, MEDIUM, LOW), `category` (one of Bug, Security, Performance, Regression, TestCoverage, Style, IntentMismatch, Other), file, line (positive int), end_line (int or null), summary, fingerprint (`<file>:<line>:<slug(summary)>`), reviewers_agreeing (array of strings), carried_from (string or null).
 
-Per dismissed_active entry: id (matches `D[0-9]+`), ref (string or null), fingerprint, severity, category, file, line, end_line, summary.
+Per dismissed_active entry: id (matches `D[0-9]+`), ref (string or null), fingerprint, `severity` (one of CRITICAL, HIGH, MEDIUM, LOW), `category` (one of Bug, Security, Performance, Regression, TestCoverage, Style, IntentMismatch, Other), file, line, end_line, summary.
+
+Top-level **optional** fields (omit if you have no data):
+- `linter_summary` (object): per-language linter counts/issues. The arbiter populates from individual reviewers' Linter Run sections.
+- `tests` (object): test suite status counts. The arbiter populates from individual reviewers' Test Suite Run sections.
 
 ### verdict rubric (§7)
 
@@ -443,6 +447,8 @@ Apply mechanically to `findings[]` only — `dismissed_active[]` does NOT count 
 - Any HIGH (no CRITICAL) → REQUEST_CHANGES
 - Only MEDIUM/LOW → APPROVE_WITH_COMMENTS
 - No findings → APPROVE
+
+**Open Questions do NOT influence the verdict.** They are concerns raised for the user to resolve (in commits/comments/Jira), not pending findings.
 
 **Linter output is never the basis for the verdict.** Treat linter findings as evidence; only manual findings drive severity.
 
