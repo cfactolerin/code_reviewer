@@ -523,9 +523,15 @@ Where:
   fall back to `git rev-list <base_sha>..<head_sha>` if no prior entry)
 - `previous_head_sha`: read the most recent `head_sha` from the existing
   ledger (if any); otherwise `null`
-- `worktree_hash` and `dismissals_hash`: look for lines in
-  `context-manifest.md` like `Worktree hash: <value>` and
-  `Dismissals hash: <value>`; use `null` if the value is `null` or missing
+- `worktree_hash` and `dismissals_hash`: compute them directly via the
+  `cr_worktree_hash` and `cr_dismissals_hash` helpers sourced from
+  `${CLAUDE_PLUGIN_ROOT}/scripts/lib.sh`. Treat empty output as `null`
+  (per spec §3.2). Example invocations:
+  ```bash
+  WORKTREE_HASH=$(cd "$REPO_ROOT" && bash -c '. "${CLAUDE_PLUGIN_ROOT}/scripts/lib.sh"; cr_worktree_hash')
+  DISMISSALS_HASH=$(bash -c '. "${CLAUDE_PLUGIN_ROOT}/scripts/lib.sh"; cr_dismissals_hash '"$BRANCH_DIR"'/DISMISSALS.md')
+  ```
+  Use JSON `null` if either command returns empty output.
 - `findings` counts: use `jq` to count entries in `findings.json`'s
   `findings[]` array filtered by severity
 - `open_questions`: `jq '.open_questions | length'`
@@ -584,9 +590,11 @@ Render the following rich-text to the user (populate all placeholders):
 <verbatim Regression section, if present>
 
 ## Open Questions (<N>) — resolve with the user before applying fixes
-- OQ1 <file>:<line> — <one-line summary>  *(Category)*
+- OQ1 <file>:<line> — <one-line summary>  *(Category, agent(s))*
 - OQ2 ...
 (omit this section entirely if open_questions[] is empty)
+(agent(s) attribution comes from FINAL_REVIEW_RESULTS.md prose — the arbiter
+records which reviewers flagged each OQ; populate from that context)
 
 ## Findings (<N>)
 - F1 (<SEVERITY>) <file>:<line> — <one-line summary>

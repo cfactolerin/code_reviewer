@@ -415,6 +415,19 @@ fi
 
 # ---- Manifest -------------------------------------------------------------
 
+# Compute worktree and dismissals hashes for the manifest + ledger entry.
+# In Delta mode current_worktree_hash / current_dismissals_hash are already
+# computed (for the nothing-new short-circuit); reuse them. In Full mode
+# compute them fresh here.
+if [ "$MODE" = "full" ]; then
+  WORKTREE_HASH=$(cd "$REPO_ROOT" && cr_worktree_hash)
+  DISMISSALS_HASH=$(cr_dismissals_hash "$BRANCH_DIR/DISMISSALS.md")
+else
+  # Delta mode: already computed above for the nothing-new check.
+  WORKTREE_HASH="${current_worktree_hash:-}"
+  DISMISSALS_HASH="${current_dismissals_hash:-}"
+fi
+
 {
   echo "# Context Manifest"
   echo
@@ -433,6 +446,8 @@ fi
   echo "| Previous review | ${prev_final:-_(first run on this branch)_} |"
   echo "| Round directory | \`$ROUND_DIR\` |"
   echo "| Timestamp | $TS |"
+  echo "| Worktree hash | \`${WORKTREE_HASH:-null}\` |"
+  echo "| Dismissals hash | \`${DISMISSALS_HASH:-null}\` |"
   echo "| code-reviewer version | $(cr_config_get _version 0.1.0) |"
   echo
   echo "## Diffstat"
